@@ -1,0 +1,5 @@
+.git
+ui/node_modules
+worker/target
+.zig
+**/.DS_Store

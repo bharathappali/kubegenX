@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package kubegenx.lease.v1;
+
+option go_package = "github.com/bharathappali/kubegenx/internal/leasev1;leasev1";
+
+// LeaseQueue is the pull protocol between stateless workers and the controller.
+service LeaseQueue {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Lease(LeaseRequest) returns (LeaseResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Progress(ProgressRequest) returns (ProgressResponse);
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+  rpc Fail(FailRequest) returns (FailResponse);
+}
+
+message RegisterRequest {
+  string worker_id = 1;
+  int32 cores = 2;
+  string version = 3;
+  string dataset = 4;
+}
+
+message RegisterResponse {
+  string plan_uri = 1;
+  string plan_digest = 2;
+  int32 lease_ttl_seconds = 3;
+}
+
+message Item {
+  string id = 1;
+  int32 wl_lo = 2;
+  int32 wl_hi = 3;
+  int32 chunk = 4;
+  int32 attempt = 5;
+  int32 item_index = 6;
+}
+
+message LeaseRequest {
+  string worker_id = 1;
+  string dataset = 2;
+  int32 n = 3;
+}
+
+message LeaseResponse {
+  repeated Item items = 1;
+  bool drained = 2;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  string dataset = 2;
+  repeated string inflight = 3;
+  int64 samples_done = 4;
+  int64 bytes = 5;
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+  bool stop = 2;
+}
+
+message FileReport {
+  string path = 1;
+  int64 bytes = 2;
+  int64 rows = 3;
+  string xxh3 = 4;
+}
+
+message CompleteRequest {
+  string worker_id = 1;
+  string dataset = 2;
+  string item_id = 3;
+  repeated FileReport files = 4;
+}
+
+message CompleteResponse {
+  bool ok = 1;
+}
+
+message ProgressRequest {
+  string worker_id = 1;
+  string dataset = 2;
+  string item_id = 3;
+  int32 chunk = 4;
+  int32 fill_pct = 5;
+  int64 bytes = 6;
+}
+
+message ProgressResponse {
+  bool ok = 1;
+}
+
+message FailRequest {
+  string worker_id = 1;
+  string dataset = 2;
+  string item_id = 3;
+  string error = 4;
+  bool retryable = 5;
+}
+
+message FailResponse {
+  bool ok = 1;
+}

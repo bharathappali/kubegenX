@@ -1,0 +1,206 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubegenx-controller
+  namespace: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubegenx-worker
+  namespace: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubegenx-thanos
+  namespace: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubegenx-controller
+  namespace: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps/finalizers"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["route.openshift.io"]
+    resources: ["routes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubegenx-controller
+  namespace: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubegenx-controller
+subjects:
+  - kind: ServiceAccount
+    name: kubegenx-controller
+    namespace: kube-gen-x
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubegenx-controller
+  namespace: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+spec:
+  selector:
+    app: kubegenx-controller
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: grpc
+      port: 9091
+      targetPort: grpc
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: kubegenx
+  namespace: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+  annotations:
+    haproxy.router.openshift.io/timeout: 180s
+spec:
+  to:
+    kind: Service
+    name: kubegenx-controller
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubegenx-controller
+  namespace: kube-gen-x
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+    app: kubegenx-controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kubegenx-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: kubegenx
+        app: kubegenx-controller
+    spec:
+      serviceAccountName: kubegenx-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 555000555
+        fsGroup: 555000555
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: quay.io/bharathappali/kube-gen-x:controller-v0.1.0
+          imagePullPolicy: Always
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: DATA_DIR
+              value: /data
+            - name: STATE_DIR
+              value: /var/lib/kubegenx
+            - name: SCRATCH_DIR
+              value: /scratch
+            - name: TMPDIR
+              value: /scratch
+            - name: GOMEMLIMIT
+              value: 7200MiB
+            - name: KUBEGENX_WORKER_IMAGE
+              value: quay.io/bharathappali/kube-gen-x:worker-v0.1.0
+            - name: KUBEGENX_THANOS_IMAGE
+              value: quay.io/thanos/thanos:v0.42.4
+            - name: KUBEGENX_POD_UID
+              value: "555000555"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 9091
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "8"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: state
+              mountPath: /var/lib/kubegenx
+            - name: scratch
+              mountPath: /scratch
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: kubegenx-data
+        - name: state
+          persistentVolumeClaim:
+            claimName: kubegenx-state
+        - name: scratch
+          emptyDir: {}

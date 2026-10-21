@@ -1,1 +1,5 @@
 instruct/
+bin/
+.zig/
+ui/node_modules/
+worker/target/
