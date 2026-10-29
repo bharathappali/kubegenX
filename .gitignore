@@ -3,3 +3,6 @@ bin/
 .zig/
 ui/node_modules/
 worker/target/
+.DS_Store
+__pycache__/
+report.txt
