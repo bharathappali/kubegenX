@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,7 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bharathappali/kubegenx/internal/export"
+	"github.com/bharathappali/kubegenx/internal/aggregate"
+	"github.com/bharathappali/kubegenx/internal/kruize"
 	"github.com/bharathappali/kubegenx/internal/planner"
 	"github.com/bharathappali/kubegenx/internal/spec"
 	"github.com/bharathappali/kubegenx/internal/store"
@@ -33,20 +36,22 @@ import (
 )
 
 type App struct {
-	NS          string
-	Data        string
-	Scratch     string
-	Store       *store.Store
-	Kube        kubernetes.Interface
-	Dyn         dynamic.Interface
-	WorkerImage string
-	ThanosImage string
-	Hub         *Hub
+	NS             string
+	Data           string
+	Scratch        string
+	Store          *store.Store
+	Kube           kubernetes.Interface
+	Dyn            dynamic.Interface
+	WorkerImage    string
+	ConverterImage string
+	ThanosImage    string
+	Hub            *Hub
 
-	mu         sync.Mutex
-	statusMu   sync.Mutex
-	exporting  map[string]bool
-	lastStatus map[string]time.Time
+	mu           sync.Mutex
+	statusMu     sync.Mutex
+	exporting    map[string]bool
+	activeExport string
+	lastStatus   map[string]time.Time
 }
 
 func (a *App) Loop(ctx context.Context) {
@@ -91,6 +96,7 @@ func (a *App) onCM(obj any) {
 }
 
 func (a *App) poll() {
+	a.expireGeneric()
 	c, cancel := ctx()
 	defer cancel()
 	list, err := a.Kube.CoreV1().ConfigMaps(a.NS).List(c, metav1.ListOptions{LabelSelector: "kubegenx.io/kind in (dataset,export)"})
@@ -100,6 +106,25 @@ func (a *App) poll() {
 	}
 	for i := range list.Items {
 		a.reconcile(&list.Items[i])
+	}
+}
+
+func (a *App) expireGeneric() {
+	rows, err := a.Store.ListExports()
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-24 * time.Hour).Unix()
+	c, cancel := ctx()
+	defer cancel()
+	for _, row := range rows {
+		if row.Type != "generic" || row.CreatedAt == 0 || row.CreatedAt > cutoff {
+			continue
+		}
+		err := a.Kube.CoreV1().ConfigMaps(a.NS).Delete(c, cmName("export", row.Name), metav1.DeleteOptions{})
+		if err != nil && !errors.IsNotFound(err) {
+			slogErr("expire session", err)
+		}
 	}
 }
 
@@ -129,7 +154,14 @@ func (a *App) reconcileDataset(cm *corev1.ConfigMap) {
 		return
 	}
 	phase, _ := a.Store.Phase(name)
-	if phase == "" {
+	if phase == "" || phase == "Queued" {
+		if a.exportsPending() {
+			if phase != "Queued" {
+				_ = a.Store.UpsertDataset(name, "Queued", "", 0, 0)
+			}
+			a.writeStatus(cm, name, map[string]any{"phase": "Queued"})
+			return
+		}
 		if err := a.planDataset(cm, name, ds); err != nil {
 			slogErr("plan", err)
 			_ = a.Store.UpsertDataset(name, "Failed", "", 0, 0)
@@ -138,6 +170,7 @@ func (a *App) reconcileDataset(cm *corev1.ConfigMap) {
 		return
 	}
 	if phase == "Generating" {
+		_ = a.Store.MarkGenerationStart(name)
 		p, err := a.Store.Progress(name)
 		if err != nil {
 			return
@@ -145,16 +178,19 @@ func (a *App) reconcileDataset(cm *corev1.ConfigMap) {
 		if p.Total > 0 && p.Done+p.Failed == p.Total && p.Leased == 0 {
 			if p.Failed > 0 {
 				_ = a.Store.SetPhase(name, "Failed")
+				_ = a.Store.MarkGenerationFinish(name)
 				a.writeStatus(cm, name, statusFrom(p, "Failed", "workers finished with failures"))
 				return
 			}
 			if _, err := verify.Dataset(a.Data, name); err != nil {
 				_ = a.Store.SetPhase(name, "Failed")
+				_ = a.Store.MarkGenerationFinish(name)
 				a.writeStatus(cm, name, statusFrom(p, "Failed", err.Error()))
 				return
 			}
 			a.deleteJob(name)
 			_ = a.Store.SetPhase(name, "Ready")
+			_ = a.Store.MarkGenerationFinish(name)
 			st := statusFrom(p, "Ready", "")
 			st["workers"] = "released"
 			a.writeStatus(cm, name, st)
@@ -172,7 +208,7 @@ func (a *App) planDataset(cm *corev1.ConfigMap, name string, ds spec.Dataset) er
 	}
 	epoch := ds.Epoch
 	if epoch == "" {
-		epoch = "2026-10-05T00:00:00Z"
+		epoch = defaultEpoch(time.Now(), tpl)
 	}
 	plan, err := planner.Build(name, tpl, epoch)
 	if err != nil {
@@ -204,14 +240,25 @@ func (a *App) planDataset(cm *corev1.ConfigMap, name string, ds spec.Dataset) er
 	if err := os.WriteFile(filepath.Join(dir, "generation.json"), raw, 0o664); err != nil {
 		return err
 	}
+	seconds := plan.Steps * plan.StepSeconds
+	entries := plan.Steps * (len(plan.Containers)*4 + len(plan.GPUs)*3)
 	man, _ := json.MarshalIndent(map[string]any{
 		"dataset": name, "digest": plan.Digest, "items": len(plan.Items),
 		"workloads": len(plan.Workloads), "containers": len(plan.Containers), "chunks": plan.Chunks,
+		"namespaces": len(plan.Namespaces), "gpus": len(plan.GPUs),
+		"samples": plan.Steps, "entries": entries,
+		"days": float64(seconds) / 86400, "stepSeconds": plan.StepSeconds,
+		"chunkSeconds": plan.ChunkSamples * plan.StepSeconds, "epoch": plan.Epoch,
+		"namespaceRanges": namespaceRanges(plan),
 	}, "", "  ")
 	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), man, 0o664)
+	if rawWL, err := json.Marshal(workloadBriefs(plan)); err == nil {
+		_ = os.WriteFile(filepath.Join(dir, "workloads.json"), rawWL, 0o664)
+	}
 	if err := a.Store.UpsertDataset(name, "Generating", plan.Digest, est, reserved); err != nil {
 		return err
 	}
+	_ = a.Store.MarkGenerationStart(name)
 	var items []store.Item
 	for _, it := range plan.Items {
 		items = append(items, store.Item{ID: it.ID, WlLo: it.WlLo, WlHi: it.WlHi, Chunk: it.Chunk, ItemIndex: it.Index})
@@ -234,6 +281,50 @@ func (a *App) planDataset(cm *corev1.ConfigMap, name string, ds spec.Dataset) er
 	return nil
 }
 
+func namespaceRanges(plan *planner.Plan) []map[string]any {
+	type span struct{ lo, hi int }
+	got := map[int]*span{}
+	for _, w := range plan.Workloads {
+		s := got[w.NamespaceID]
+		if s == nil {
+			s = &span{lo: w.ID, hi: w.ID + 1}
+			got[w.NamespaceID] = s
+			continue
+		}
+		if w.ID < s.lo {
+			s.lo = w.ID
+		}
+		if w.ID+1 > s.hi {
+			s.hi = w.ID + 1
+		}
+	}
+	out := make([]map[string]any, 0, len(plan.Namespaces))
+	for _, ns := range plan.Namespaces {
+		s := got[ns.ID]
+		lo, hi := 0, 0
+		if s != nil {
+			lo, hi = s.lo, s.hi
+		}
+		out = append(out, map[string]any{"id": ns.ID, "name": ns.Name, "wlLo": lo, "wlHi": hi, "count": hi - lo})
+	}
+	return out
+}
+
+func workloadBriefs(plan *planner.Plan) []map[string]any {
+	ns := map[int]string{}
+	for _, n := range plan.Namespaces {
+		ns[n.ID] = n.Name
+	}
+	out := make([]map[string]any, 0, len(plan.Workloads))
+	for _, w := range plan.Workloads {
+		out = append(out, map[string]any{
+			"id": w.ID, "namespaceId": w.NamespaceID, "namespace": ns[w.NamespaceID],
+			"name": w.Name, "kind": w.Kind, "replicas": w.Replicas, "gpu": w.GPU,
+		})
+	}
+	return out
+}
+
 func statusFrom(p store.Progress, phase, errMsg string) map[string]any {
 	pct := 0.0
 	if p.Total > 0 {
@@ -254,26 +345,42 @@ func (a *App) publish(dataset string) {
 	a.publishProgress(dataset, "")
 }
 
-func (a *App) publishProgress(dataset, phase string) {
-	if a.Hub == nil {
-		return
-	}
-	p, err := a.Store.Progress(dataset)
-	if err != nil {
-		return
-	}
+func (a *App) progressDoc(dataset, phase string) map[string]any {
+	p, _ := a.Store.Progress(dataset)
 	if phase == "" {
 		phase, _ = a.Store.Phase(dataset)
 	}
+	doc := statusFrom(p, phase, "")
+	doc["name"] = dataset
+	if started, finished, err := a.Store.GenerationTimes(dataset); err == nil {
+		if started > 0 {
+			doc["startedAt"] = started
+		}
+		if finished > 0 {
+			doc["finishedAt"] = finished
+		}
+	}
+	cells, err := a.Store.Cells(dataset)
+	if err != nil || cells == nil {
+		cells = []store.Cell{}
+	}
+	doc["cells"] = cells
 	pct := 0.0
 	if p.Total > 0 {
 		pct = float64(p.Done) / float64(p.Total) * 100
 	}
-	a.Hub.Broadcast("dataset:"+dataset, map[string]any{
-		"v": 1, "type": "progress", "topic": "dataset:" + dataset,
-		"phase": phase,
-		"kpi":   map[string]any{"itemsDone": p.Done, "itemsTotal": p.Total, "bytes": p.Bytes, "percent": pct},
-	})
+	doc["type"] = "progress"
+	doc["v"] = 1
+	doc["topic"] = "dataset:" + dataset
+	doc["kpi"] = map[string]any{"itemsDone": p.Done, "itemsTotal": p.Total, "bytes": p.Bytes, "percent": pct, "itemsLeased": p.Leased, "itemsFailed": p.Failed}
+	return doc
+}
+
+func (a *App) publishProgress(dataset, phase string) {
+	if a.Hub == nil {
+		return
+	}
+	a.Hub.Broadcast("dataset:"+dataset, a.progressDoc(dataset, phase))
 }
 
 func (a *App) writeStatus(parent *corev1.ConfigMap, name string, doc map[string]any) {
@@ -372,32 +479,95 @@ func (a *App) reconcileExport(cm *corev1.ConfigMap) {
 		return
 	}
 	row, err := a.Store.GetExport(name)
-	if err != nil || row.Phase == "" || row.Phase == "Failed" && false {
-		// start once
-	}
-	phase := row.Phase
-	if phase == "Serving" || phase == "Building" || phase == "Failed" {
+	if err != nil {
 		return
 	}
-	for _, busy := range a.exporting {
-		if busy {
-			return
+	if row.Phase != "Queued" && row.Phase != "Building" {
+		return
+	}
+	a.kickExportLocked()
+}
+
+// exportsPending is true while any parquet conversion is queued or running.
+// New datasets stay queued until that work finishes.
+func (a *App) exportsPending() bool {
+	rows, err := a.Store.ListExports()
+	if err != nil {
+		return true
+	}
+	for _, row := range rows {
+		if row.Phase == "Queued" || row.Phase == "Building" {
+			return true
 		}
 	}
-	if a.exporting[name] {
+	return false
+}
+
+// kickExportLocked starts the single parquet conversion. A Building export
+// resumes first. Every other dataset and export stays queued until it returns.
+// Caller holds a.mu.
+func (a *App) kickExportLocked() {
+	if a.activeExport != "" {
 		return
 	}
-	a.exporting[name] = true
-	go a.buildExport(cm.Name, name)
+	if a.datasetsBusy() {
+		return
+	}
+	rows, err := a.Store.ListExports()
+	if err != nil {
+		slogErr("list exports", err)
+		return
+	}
+	var pick *store.ExportRow
+	for i := range rows {
+		row := rows[i]
+		if row.Phase != "Queued" && row.Phase != "Building" {
+			continue
+		}
+		if a.exporting != nil && a.exporting[row.Name] {
+			continue
+		}
+		if pick == nil || aheadOfExport(row, *pick) {
+			cp := row
+			pick = &cp
+		}
+	}
+	if pick == nil {
+		return
+	}
+	if a.exporting == nil {
+		a.exporting = map[string]bool{}
+	}
+	a.exporting[pick.Name] = true
+	a.activeExport = pick.Name
+	slog.Info("export start", "name", pick.Name, "phase", pick.Phase)
+	go a.buildExport(cmName("export", pick.Name), pick.Name)
+}
+
+func aheadOfExport(cand, cur store.ExportRow) bool {
+	if cand.Phase == "Building" && cur.Phase != "Building" {
+		return true
+	}
+	if cur.Phase == "Building" && cand.Phase != "Building" {
+		return false
+	}
+	if cand.CreatedAt != cur.CreatedAt {
+		return cand.CreatedAt < cur.CreatedAt
+	}
+	return cand.Name < cur.Name
 }
 
 func (a *App) buildExport(cmName, name string) {
 	defer func() {
 		a.mu.Lock()
 		delete(a.exporting, name)
+		if a.activeExport == name {
+			a.activeExport = ""
+		}
+		a.kickExportLocked()
 		a.mu.Unlock()
 	}()
-	c, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	c, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
 	defer cancel()
 	cm, err := a.Kube.CoreV1().ConfigMaps(a.NS).Get(c, cmName, metav1.GetOptions{})
 	if err != nil {
@@ -415,7 +585,7 @@ func (a *App) buildExport(cmName, name string) {
 	}
 	raw, err := os.ReadFile(filepath.Join(a.Data, "datasets", dsName, "plan", "generation.json"))
 	if err != nil {
-		_ = a.Store.UpsertExport(store.ExportRow{Name: name, Dataset: dsName, Phase: "Failed"})
+		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", 0)
 		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
 		return
 	}
@@ -423,32 +593,73 @@ func (a *App) buildExport(cmName, name string) {
 	if err := json.Unmarshal(raw, &plan); err != nil {
 		return
 	}
+	raw = nil
 	start, err := time.Parse(time.RFC3339, ex.StartTime)
 	if err != nil {
 		start = time.Now().UTC().Truncate(15 * time.Minute)
 	}
-	_ = a.Store.UpsertExport(store.ExportRow{Name: name, Dataset: dsName, Phase: "Building", StartTime: start.UTC().Format(time.RFC3339)})
-	a.writeStatus(cm, name, map[string]any{"phase": "Building", "startTime": start.UTC().Format(time.RFC3339)})
-	res, err := export.Build(c, &plan, filepath.Join(a.Data, "datasets", dsName), a.Scratch, name, start, ex.ExternalLabels)
+	end := start.Add(time.Duration(plan.Steps*plan.StepSeconds) * time.Second)
+	if ex.EndTime != "" {
+		if parsed, err := time.Parse(time.RFC3339, ex.EndTime); err == nil {
+			end = parsed
+		}
+	}
+	started := time.Now().Unix()
+	if ex.Type == "generic" {
+		a.buildGeneric(cm, name, dsName, &plan, ex, start, end, started)
+		return
+	}
+	if row, err := a.Store.GetExport(name); err == nil && row.StartedAt > 0 && row.Phase == "Building" {
+		started = row.StartedAt
+	}
+	a.runConverters(c, cm, name, dsName, &plan, ex, start, end, started)
+}
+
+func (a *App) buildGeneric(cm *corev1.ConfigMap, name, dsName string, plan *planner.Plan, ex spec.Export, start, end time.Time, started int64) {
+	step := time.Duration(plan.StepSeconds) * time.Second
+	interval, err := aggregate.ParseInterval(ex.Interval, step)
 	if err != nil {
-		slogErr("export build", err)
-		_ = a.Store.UpsertExport(store.ExportRow{Name: name, Dataset: dsName, Phase: "Failed", StartTime: start.UTC().Format(time.RFC3339)})
+		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
 		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
 		return
 	}
-	url, err := a.ensureThanos(cm, name, dsName)
+	_ = a.Store.TouchExport(name, "Building", 0, 0, 0, "", started)
+	rows, err := kruize.Buckets(plan, filepath.Join(a.Data, "datasets", dsName), start, interval)
 	if err != nil {
-		slogErr("thanos", err)
-		_ = a.Store.UpsertExport(store.ExportRow{Name: name, Dataset: dsName, Phase: "Failed", Blocks: res.Blocks, Bytes: res.Bytes})
-		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error(), "blocks": res.Blocks})
+		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
+		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
 		return
 	}
-	_ = a.Store.UpsertExport(store.ExportRow{Name: name, Dataset: dsName, Phase: "Serving", StartTime: start.UTC().Format(time.RFC3339), Blocks: res.Blocks, Bytes: res.Bytes, URL: url})
-	a.writeStatus(cm, name, map[string]any{"phase": "Serving", "url": url, "blocks": res.Blocks, "bytes": res.Bytes, "startTime": start.UTC().Format(time.RFC3339)})
+	dir := filepath.Join(a.Data, "exports", dsName, name)
+	if err := os.MkdirAll(dir, 0o775); err != nil {
+		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
+		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
+		return
+	}
+	raw, err := json.Marshal(map[string]any{"start": start, "end": end, "interval": ex.Interval, "rows": rows})
+	if err != nil {
+		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
+		return
+	}
+	path := filepath.Join(dir, "buckets.json")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
+		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
+		return
+	}
+	info, _ := os.Stat(path)
+	var n int64
+	if info != nil {
+		n = info.Size()
+	}
+	_ = a.Store.TouchExport(name, "Serving", len(rows), len(rows), n, "", started)
+	a.writeStatus(cm, name, map[string]any{"phase": "Serving", "sessionId": ex.SessionID, "startTime": start.UTC().Format(time.RFC3339), "endTime": end.UTC().Format(time.RFC3339), "interval": ex.Interval})
 }
 
 func (a *App) cleanupExport(cm *corev1.ConfigMap, name string) {
 	ds := cm.Labels["kubegenx.io/dataset"]
+	a.deleteConverterJob(name)
+	_ = a.Store.DeleteBlocks(name)
 	a.deleteThanos(name)
 	if ds != "" {
 		_ = os.RemoveAll(filepath.Join(a.Data, "exports", ds, name))
@@ -638,6 +849,38 @@ func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string)
 		return "", fmt.Errorf("route host not assigned")
 	}
 	return "https://" + host, nil
+}
+
+func withQueryWindow(raw string, start, end time.Time) string {
+	if raw == "" || !end.After(start) {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	dur := end.Sub(start)
+	endStamp := end.UTC().Format("2006-01-02 15:04:05")
+	u.Path = "/graph"
+	q := url.Values{}
+	q.Set("g0.expr", "count by (namespace) (kube_pod_info)")
+	q.Set("g0.tab", "0")
+	q.Set("g0.range_input", promRange(dur))
+	q.Set("g0.end_input", endStamp)
+	q.Set("g0.moment_input", endStamp)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func promRange(d time.Duration) string {
+	switch {
+	case d%(24*time.Hour) == 0:
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	default:
+		return fmt.Sprintf("%ds", int(d/time.Second))
+	}
 }
 
 func (a *App) deleteThanos(exportName string) {

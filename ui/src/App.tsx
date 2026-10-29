@@ -1,101 +1,287 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  AppShell,
-  Badge,
   Button,
-  Card,
-  Code,
-  Container,
   Group,
   Modal,
-  NavLink,
   NumberInput,
+  Popover,
   Progress,
+  SegmentedControl,
   Select,
   Stack,
-  Switch,
-  Table,
   Text,
   TextInput,
   Title,
 } from "@mantine/core";
-import { api, type DatasetItem, type ExportItem, type Progress as Prog, type StorageView } from "./api";
+import { api, type DatasetItem, type ExportItem, type StorageView } from "./api";
+import { Icon, IconButton, EmptyMark } from "./icons";
+import { EffortField } from "./effort";
+import { datasetFromHash, Live } from "./live";
+import { randomName } from "./names";
+import { THEMES } from "./theme";
 
-type Page = "wizard" | "live" | "datasets" | "exports" | "storage" | "sessions";
+type Page = "wizard" | "status" | "datasets" | "storage";
 
-const nav: { id: Page; label: string }[] = [
-  { id: "wizard", label: "Template" },
-  { id: "live", label: "Live" },
-  { id: "datasets", label: "Datasets" },
-  { id: "exports", label: "Exports" },
-  { id: "storage", label: "Storage" },
-  { id: "sessions", label: "Sessions" },
+const nav: { id: Exclude<Page, "status">; label: string; icon: string }[] = [
+  { id: "wizard", label: "Create", icon: "plus" },
+  { id: "datasets", label: "Datasets", icon: "grid" },
+  { id: "storage", label: "Storage", icon: "storage" },
 ];
 
-function pageFromHash(): Page {
-  const id = location.hash.replace("#/", "") as Page;
-  return nav.some((n) => n.id === id) ? id : "wizard";
+function hashPage(): string {
+  return location.hash.replace(/^#\/?/, "").split("?")[0];
 }
 
-export function App() {
+function pageFromHash(): Page {
+  const id = hashPage();
+  if (id === "live" || id === "status") return "status";
+  if (id === "exports" || id === "datasets" || id === "sessions") return "datasets";
+  if (id === "storage" || id === "wizard") return id;
+  return "wizard";
+}
+
+function phaseWord(phase: string): string {
+  switch (phase) {
+    case "Generating":
+      return "GENERATING";
+    case "Ready":
+      return "READY";
+    case "Failed":
+      return "FAILED";
+    case "Building":
+      return "BUILDING";
+    case "Serving":
+      return "SERVING";
+    case "Pending":
+    case "Planning":
+    case "Queued":
+      return "QUEUED";
+    default:
+      return phase ? "QUEUED" : "IDLE";
+  }
+}
+
+const RANK = ["GENERATING", "BUILDING", "FAILED", "QUEUED", "SERVING", "READY", "IDLE"];
+
+function fleetWord(page: Page, datasets: DatasetItem[], exports: ExportItem[]): string {
+  if (datasets.some((d) => (d.phase ?? d.progress?.phase) === "Queued")) return "QUEUED";
+  if (page === "status") {
+    const name = datasetFromHash();
+    const ds = datasets.find((d) => d.name === name);
+    if (!ds) return datasets.length ? "QUEUED" : "IDLE";
+    return phaseWord(ds.phase ?? ds.progress?.phase ?? "");
+  }
+  const words = [
+    ...datasets.map((d) => phaseWord(d.phase ?? d.progress?.phase ?? "")),
+    ...exports.map((e) => phaseWord(e.phase)),
+  ];
+  if (words.length === 0) return "IDLE";
+  return RANK.find((word) => words.includes(word)) ?? "IDLE";
+}
+
+function toneFor(word: string): string {
+  if (word === "FAILED") return "bad";
+  if (word === "GENERATING" || word === "BUILDING" || word === "QUEUED") return "work";
+  return "ok";
+}
+
+type Notice = { id: number; title: string; body: string; at: number };
+
+let noticeSeq = 1;
+
+function phaseOf(d: DatasetItem): string {
+  return d.phase ?? d.progress?.phase ?? "";
+}
+
+export function App({ themeId, onTheme }: { themeId: number; onTheme: (id: number) => void }) {
   const [page, setPage] = useState<Page>(pageFromHash());
-  const [toast, setToast] = useState("");
+  const [hash, setHash] = useState(location.hash);
+  const [notice, setNotice] = useState("");
+  const [word, setWord] = useState("IDLE");
+  const [notes, setNotes] = useState<Notice[]>([]);
+  const [unread, setUnread] = useState(0);
+  const [bell, setBell] = useState(false);
+  const phases = useRef<Map<string, string> | null>(null);
+  const bellOpen = useRef(false);
+  const note = (message: string) => {
+    setNotice(message);
+    window.setTimeout(() => setNotice((current) => (current === message ? "" : current)), 4000);
+  };
   useEffect(() => {
-    const onHash = () => setPage(pageFromHash());
+    const onHash = () => {
+      const id = hashPage();
+      if (id === "live") {
+        const q = location.hash.includes("?") ? location.hash.slice(location.hash.indexOf("?")) : "";
+        location.replace("#/status" + q);
+        return;
+      }
+      if (id === "exports" || id === "sessions") {
+        location.replace("#/datasets");
+        return;
+      }
+      setPage(pageFromHash());
+      setHash(location.hash);
+    };
+    if (hashPage() === "live") onHash();
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-  const go = (id: Page) => {
+  useEffect(() => {
+    let stop = false;
+    const pull = async () => {
+      try {
+        const [ds, ex] = await Promise.all([
+          api<{ items: DatasetItem[] }>("/api/v1/datasets"),
+          api<{ items: ExportItem[] }>("/api/v1/exports"),
+        ]);
+        if (stop) return;
+        const items = ds.items ?? [];
+        const fresh: Notice[] = [];
+        const next = new Map<string, string>();
+        for (const item of items) {
+          const phase = phaseOf(item);
+          next.set(item.name, phase);
+          const before = phases.current?.get(item.name);
+          if (!phases.current) {
+            if (phase === "Queued") fresh.push({ id: noticeSeq++, title: `${item.name} is queued`, body: "Generation waits until the export finishes.", at: Date.now() });
+            continue;
+          }
+          if (phase === "Queued" && before !== "Queued") {
+            fresh.push({ id: noticeSeq++, title: `${item.name} is queued`, body: "Generation waits until the export finishes.", at: Date.now() });
+          }
+          if (before === "Queued" && phase && phase !== "Queued") {
+            fresh.push({ id: noticeSeq++, title: `${item.name} resumed`, body: `Generation is ${phase.toLowerCase()}.`, at: Date.now() });
+          }
+        }
+        phases.current = next;
+        if (fresh.length) {
+          setNotes((list) => [...fresh].reverse().concat(list).slice(0, 40));
+          if (!bellOpen.current) setUnread((n) => n + fresh.length);
+        }
+        setWord(fleetWord(page, items, ex.items ?? []));
+      } catch {
+        /* keep the last status word */
+      }
+    };
+    void pull();
+    const id = window.setInterval(() => void pull(), 3000);
+    return () => {
+      stop = true;
+      window.clearInterval(id);
+    };
+  }, [page, hash]);
+  const go = (id: Exclude<Page, "status">) => {
     location.hash = "#/" + id;
   };
   return (
-    <AppShell header={{ height: 56 }} navbar={{ width: 200, breakpoint: "sm" }} padding="md" styles={{ main: { background: "#1F2A3A" }, header: { background: "#4D6787" }, navbar: { background: "#243044" } }}>
-      <AppShell.Header>
-        <Group h="100%" px="md" justify="space-between">
-          <Title order={3} c="#F7F8FB">KubeGenX</Title>
-          {toast ? <Badge color="butter" c="#1F2A3A">{toast}</Badge> : null}
-        </Group>
-      </AppShell.Header>
-      <AppShell.Navbar p="sm">
-        {nav.map((n) => (
-          <NavLink key={n.id} label={n.label} active={page === n.id} onClick={() => go(n.id)} color="pink" />
-        ))}
-      </AppShell.Navbar>
-      <AppShell.Main>
-        <Container size="lg">
-          {page === "wizard" && <Wizard onToast={setToast} />}
-          {page === "live" && <Live onToast={setToast} />}
-          {page === "datasets" && <Datasets onToast={setToast} />}
-          {page === "exports" && <Exports onToast={setToast} />}
+    <div className="app">
+      <header className="topbar">
+        <div className="tb-card glass brand-card">
+          <span className="brand-mark" />
+          <span className="brand">KubeGenX</span>
+        </div>
+        <nav className="tb-card glass tab-card">
+          {nav.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              aria-current={page === item.id || (item.id === "datasets" && page === "status") ? "page" : undefined}
+              onClick={() => go(item.id)}
+            >
+              <Icon name={item.icon} />
+              <span>{item.label}</span>
+            </button>
+          ))}
+        </nav>
+        <div className="tb-card glass right-card">
+          <div className="themes">
+            {THEMES.map((theme) => (
+              <button
+                key={theme.id}
+                type="button"
+                className="theme-dot"
+                aria-label={`Theme ${theme.id}`}
+                title={`Theme ${theme.id}`}
+                aria-pressed={themeId === theme.id}
+                style={{ background: `conic-gradient(${theme.colors[0]} 0 25%, ${theme.colors[1]} 0 50%, ${theme.colors[2]} 0 75%, ${theme.colors[3]} 0 100%)` }}
+                onClick={() => onTheme(theme.id)}
+              />
+            ))}
+          </div>
+          <Popover opened={bell} onChange={(v) => { setBell(v); bellOpen.current = v; if (v) setUnread(0); }} position="bottom-end" shadow="md" withinPortal>
+            <Popover.Target>
+              <button type="button" className="bell" aria-label="Notifications" aria-expanded={bell}>
+                <Icon name="bell" />
+                {unread > 0 ? <span className="bell-dot" /> : null}
+              </button>
+            </Popover.Target>
+            <Popover.Dropdown className="note-dropdown">
+              <div className="note-pop">
+                <strong>Notifications</strong>
+                {notes.length === 0 ? <p>No notifications yet.</p> : notes.map((item) => (
+                  <div key={item.id} className="note-item">
+                    <b>{item.title}</b>
+                    <span>{item.body}</span>
+                    <time>{new Date(item.at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</time>
+                  </div>
+                ))}
+              </div>
+            </Popover.Dropdown>
+          </Popover>
+          <span className="chip" data-tone={toneFor(word)}><span className="dot" />{word}</span>
+        </div>
+      </header>
+      {notice ? <div className="notice glass">{notice}</div> : null}
+      <div className="body">
+        <main className={page === "wizard" ? "stage glass pane form-stage" : "stage glass pane"}>
+          {page === "wizard" && <Wizard onNotice={note} />}
+          {page === "status" && <Live onNotice={note} />}
+          {page === "datasets" && <Datasets onNotice={note} />}
           {page === "storage" && <Storage />}
-          {page === "sessions" && <Sessions />}
-        </Container>
-      </AppShell.Main>
-    </AppShell>
+        </main>
+        <div id="export-dock" className="export-dock" />
+      </div>
+    </div>
   );
 }
 
-function Wizard({ onToast }: { onToast: (s: string) => void }) {
-  const [name, setName] = useState("demo");
+function Empty({ title, text, create }: { title: string; text: string; create?: boolean }) {
+  return (
+    <div className="empty glass">
+      <EmptyMark />
+      <strong>{title}</strong>
+      <p>{text}</p>
+      {create ? <a className="create-link" href="#/wizard">Create data</a> : null}
+    </div>
+  );
+}
+
+function Wizard({ onNotice }: { onNotice: (s: string) => void }) {
+  const [name, setName] = useState(randomName);
   const [mode, setMode] = useState("NamespaceMatrix");
   const [namespaces, setNamespaces] = useState<number | string>(3);
   const [perNs, setPerNs] = useState<number | string>(5);
   const [total, setTotal] = useState<number | string>(15);
-  const [gpu, setGpu] = useState<number | string>(1);
+  const [gpuPercent, setGpuPercent] = useState<number | string>(7);
   const [days, setDays] = useState<number | string>(1);
   const [step, setStep] = useState("15s");
+  const [effort, setEffort] = useState("xhigh");
   const [busy, setBusy] = useState(false);
+  const workloadCount = mode === "NamespaceMatrix" ? Number(namespaces) * Number(perNs) : Number(total);
+  const percent = Number(gpuPercent) || 0;
+  const gpuCount = percent <= 0 || workloadCount <= 0 ? 0 : Math.max(1, Math.round((percent / 100) * workloadCount));
   const submit = async () => {
     setBusy(true);
     try {
-      const n = Number(mode === "NamespaceMatrix" ? Number(namespaces) * Number(perNs) : total);
-      const ratio = n > 0 ? Number(gpu) / n : 0;
+      const ratio = percent / 100;
       const spec = {
         seed: 424242,
         topology: {
           mode,
           totalWorkloads: Number(total),
-          namespaces: { count: Number(namespaces), distribution: "Uniform", zipfS: 0 },
+          namespaces: mode === "TotalWorkloads"
+            ? { count: 0, distribution: "Zipf", zipfS: 1 }
+            : { count: Number(namespaces), distribution: "Uniform", zipfS: 0 },
           workloadsPerNamespace: Number(perNs),
           kinds: { Deployment: 0.8, StatefulSet: 0.2 },
           replicas: {
@@ -111,277 +297,284 @@ function Wizard({ onToast }: { onToast: (s: string) => void }) {
           behaviours: { steady: 0.3, diurnal: 0.4, bursty: 0.15, batchOnOff: 0.1, idleWindows: 0.05 },
           anomalies: { throttleAggressive: 0.08, memoryLeak: 0.03, oomLoop: 0.01, spikes: 0.1 },
         },
-        gpu: { enabled: Number(gpu) > 0, workloadRatio: ratio, nodePools: ["p4d.24xlarge"], migRatio: 0.3, labelProfile: "kruize" },
+        gpu: { enabled: percent > 0, workloadRatio: ratio, nodePools: ["p4d.24xlarge"], migRatio: 0.3, labelProfile: "kruize" },
         nodes: { pools: [{ instanceType: "m7i.4xlarge", weight: 1 }], maxPodsPerNode: 250 },
-        time: { step, duration: `${Number(days)}d`, chunk: "6h", epoch: "2026-10-05T00:00:00Z" },
+        time: { step, duration: `${Number(days)}d`, chunk: "6h" },
         features: ["cpu", "memory", "gpu", "ksm"],
         workloadLabels: {
           scope: "namespace",
           keys: [
-            { key: "org_id", values: [{ value: "acme-retail", weight: 3 }, { value: "globex", weight: 1 }] },
-            { key: "cluster_id", values: [{ value: "ocp-east-1", weight: 2 }, { value: "ocp-west-2", weight: 1 }] },
+            { key: "org_id" },
+            { key: "cluster_id" },
           ],
           carryOn: ["namespace", "ksm-pod", "ksm-container", "recorded", "cadvisor"],
         },
-        workers: { count: 2, cpu: "500m", memory: "1Gi", threads: 2 },
+        workers: { cpu: "500m", memory: "1Gi", threads: 2 },
         workItem: { workloadsPerItem: 1024 },
       };
       await api("/api/v1/templates", { method: "POST", body: JSON.stringify({ name, spec }) });
-      await api("/api/v1/datasets", { method: "POST", body: JSON.stringify({ name, template: name, epoch: "2026-10-05T00:00:00Z", workers: { count: 2, cpu: "500m", memory: "1Gi", threads: 2 } }) });
-      onToast("dataset " + name + " queued");
-      location.hash = "#/live";
+      await api("/api/v1/datasets", { method: "POST", body: JSON.stringify({ name, template: name, effort, workers: { cpu: "500m", memory: "1Gi", threads: 2 } }) });
+      location.hash = "#/status?name=" + encodeURIComponent(name);
     } catch (err) {
-      onToast(err instanceof Error ? err.message : "failed");
+      onNotice(err instanceof Error ? err.message : "Could not create the dataset");
     } finally {
       setBusy(false);
     }
   };
   return (
+    <div className="form-sheet">
     <Stack>
-      <Title order={2} c="#F7F8FB">Template wizard</Title>
-      <TextInput label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} />
-      <Select label="Topology" data={["NamespaceMatrix", "TotalWorkloads"]} value={mode} onChange={(v) => setMode(v ?? "NamespaceMatrix")} />
+      <Title order={2}>Create</Title>
+      <Group align="flex-end">
+        <TextInput style={{ flex: 1 }} label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} />
+        <IconButton label="New name" onClick={() => setName(randomName())}><Icon name="shuffle" /></IconButton>
+      </Group>
+      <div>
+        <Text size="sm" fw={700} mb={6}>Shape</Text>
+        <div className="tabs-center">
+          <SegmentedControl
+            value={mode}
+            onChange={setMode}
+            data={[
+              { label: "By namespace", value: "NamespaceMatrix" },
+              { label: "By workloads", value: "TotalWorkloads" },
+            ]}
+            color="slate"
+          />
+        </div>
+      </div>
       {mode === "NamespaceMatrix" ? (
         <Group grow>
           <NumberInput label="Namespaces" value={namespaces} onChange={setNamespaces} min={1} />
-          <NumberInput label="Workloads per namespace" value={perNs} onChange={setPerNs} min={1} />
+          <NumberInput label="Workloads in each" value={perNs} onChange={setPerNs} min={1} />
         </Group>
       ) : (
-        <NumberInput label="Total workloads" value={total} onChange={setTotal} min={1} />
+        <NumberInput label="Workloads" description="Spread unevenly, so some namespaces have more than others." value={total} onChange={setTotal} min={1} />
       )}
-      <Group grow>
-        <NumberInput label="GPU workloads" value={gpu} onChange={setGpu} min={0} />
+      <Group grow align="flex-end">
+        <NumberInput label="GPU workloads" description={`${percent}% · ${gpuCount} of ${workloadCount || 0}`} value={gpuPercent} onChange={setGpuPercent} min={0} max={100} suffix="%" />
         <NumberInput label="Days" value={days} onChange={setDays} min={1} />
-        <TextInput label="Step" value={step} onChange={(e) => setStep(e.currentTarget.value)} />
+        <Select
+          label="Data interval"
+          value={step}
+          onChange={(v) => setStep(v ?? "15s")}
+          data={[
+            { value: "15s", label: "15 seconds" },
+            { value: "30s", label: "30 seconds" },
+            { value: "45s", label: "45 seconds" },
+            { value: "60s", label: "60 seconds" },
+          ]}
+        />
       </Group>
-      <Text c="dimmed" size="sm">Replica buckets 70/22/8. Usage bands idle, low, medium, high. Labels org_id and cluster_id per namespace.</Text>
-      <Button color="mint" c="#1F2A3A" onClick={submit} loading={busy}>Create dataset</Button>
+      <EffortField value={effort} onChange={setEffort} />
+      <Text c="dimmed" size="sm">Most workloads have 1–3 replicas. Usage is a mix of idle, low, medium, and high.</Text>
+      <Button color="mint" c="#1B2430" onClick={() => void submit()} loading={busy}>Create dataset</Button>
     </Stack>
+    </div>
   );
 }
 
-function Live({ onToast }: { onToast: (s: string) => void }) {
-  const [name, setName] = useState("demo");
-  const [prog, setProg] = useState<Prog>({});
-  const [bar, setBar] = useState(false);
-  const canvas = useRef<HTMLCanvasElement>(null);
-  const started = useRef<number>(Date.now());
-  useEffect(() => {
-    let stop = false;
-    const pull = async () => {
-      try {
-        const p = await api<Prog>("/api/v1/datasets/" + encodeURIComponent(name) + "/progress");
-        if (!stop) setProg(p);
-      } catch {
-        /* dataset may not exist yet */
-      }
-    };
-    void pull();
-    const id = setInterval(pull, 2000);
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/api/v1/ws?topics=dataset:${encodeURIComponent(name)}`);
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data) as { phase?: string; kpi?: { percent?: number; itemsDone?: number; itemsTotal?: number; bytes?: number } };
-      setProg((prev) => ({
-        ...prev,
-        phase: msg.phase ?? prev.phase,
-        percent: msg.kpi?.percent ?? prev.percent,
-        bytes: msg.kpi?.bytes ?? prev.bytes,
-        items: {
-          total: msg.kpi?.itemsTotal ?? prev.items?.total ?? 0,
-          done: msg.kpi?.itemsDone ?? prev.items?.done ?? 0,
-          failed: prev.items?.failed ?? 0,
-          leased: prev.items?.leased ?? 0,
-        },
-      }));
-      if (msg.phase === "Ready") onToast("generation complete");
-    };
-    return () => {
-      stop = true;
-      clearInterval(id);
-      ws.close();
-    };
-  }, [name, onToast]);
-  const total = prog.items?.total ?? 0;
-  const done = prog.items?.done ?? 0;
-  const pct = prog.percent ?? (total ? (done / total) * 100 : 0);
-  const eta = useMemo(() => {
-    const elapsed = (Date.now() - started.current) / 1000;
-    if (pct <= 0 || pct >= 100) return pct >= 100 ? "0s" : "—";
-    const left = elapsed * ((100 - pct) / pct);
-    return Math.round(left) + "s";
-  }, [pct]);
-  useEffect(() => {
-    const c = canvas.current;
-    if (!c) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-    const cells = Math.max(total, 1);
-    const cols = Math.min(24, cells);
-    const rows = Math.ceil(cells / cols);
-    c.width = cols * 22;
-    c.height = rows * 22;
-    ctx.clearRect(0, 0, c.width, c.height);
-    for (let i = 0; i < cells; i++) {
-      const x = (i % cols) * 22 + 10;
-      const y = Math.floor(i / cols) * 22 + 10;
-      ctx.beginPath();
-      ctx.arc(x, y, 8, 0, Math.PI * 2);
-      ctx.fillStyle = i < done ? "#7DCCAD" : "#4D6787";
-      ctx.fill();
-    }
-  }, [total, done]);
-  return (
-    <Stack>
-      <Title order={2} c="#F7F8FB">Live progress</Title>
-      <TextInput label="Dataset" value={name} onChange={(e) => { started.current = Date.now(); setName(e.currentTarget.value); }} />
-      <Group>
-        <Badge color="pink">{prog.phase ?? "unknown"}</Badge>
-        <Text c="#F7F8FB">{pct.toFixed(1)}%</Text>
-        <Text c="#FFEA88">ETA {eta}</Text>
-        <Text c="dimmed">{done}/{total} chunks</Text>
-      </Group>
-      <Switch label="Torrent bar" checked={bar} onChange={(e) => setBar(e.currentTarget.checked)} />
-      {bar ? <Progress value={pct} color="mint" /> : <canvas ref={canvas} style={{ background: "#243044", borderRadius: 8 }} />}
-    </Stack>
-  );
+function exporterLabel(rows: ExportItem[]): string {
+  let thanos = false;
+  let generic = false;
+  for (const row of rows) {
+    if (row.phase !== "Serving" && row.phase !== "Building" && row.phase !== "Queued") continue;
+    if (row.type === "generic") generic = true;
+    else thanos = true;
+  }
+  if (thanos && generic) return "Thanos and Aggregation";
+  if (thanos) return "Thanos";
+  if (generic) return "Aggregation";
+  return "No exporters";
 }
 
-function Datasets({ onToast }: { onToast: (s: string) => void }) {
+function intervalLabel(step?: number): string {
+  if (!step) return "—";
+  return `${step}s`;
+}
+
+function dayLabel(days?: number): string {
+  if (days == null || Number.isNaN(days)) return "—";
+  const whole = Math.abs(days - Math.round(days)) < 0.05;
+  const n = whole ? Math.round(days) : Math.round(days * 10) / 10;
+  return `${n} ${n === 1 ? "day" : "days"}`;
+}
+
+function shortCount(n: number): string {
+  const sign = n < 0 ? "-" : "";
+  let abs = Math.abs(n);
+  const units = ["", "k", "M", "B"];
+  let i = 0;
+  while (abs >= 1000 && i < units.length - 1) {
+    abs /= 1000;
+    i++;
+  }
+  if (i === 0) return n.toLocaleString();
+  let rounded = abs >= 100 ? Math.round(abs) : Math.round(abs * 10) / 10;
+  if (rounded >= 1000 && i < units.length - 1) {
+    rounded /= 1000;
+    i++;
+    rounded = Math.round(rounded * 10) / 10;
+  }
+  const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  return sign + text + units[i];
+}
+
+function countLabel(n: number | undefined, one: string, many: string): string {
+  if (n == null) return "—";
+  return `${shortCount(n)} ${n === 1 ? one : many}`;
+}
+
+function openStatus(name: string) {
+  location.hash = "#/status?name=" + encodeURIComponent(name);
+}
+
+function Datasets({ onNotice }: { onNotice: (s: string) => void }) {
   const [items, setItems] = useState<DatasetItem[]>([]);
-  const load = () => api<{ items: DatasetItem[] }>("/api/v1/datasets").then((r) => setItems(r.items ?? [])).catch((e: Error) => onToast(e.message));
-  useEffect(() => { void load(); }, []);
-  return (
-    <Stack>
-      <Group justify="space-between"><Title order={2} c="#F7F8FB">Datasets</Title><Button variant="light" onClick={() => void load()}>Refresh</Button></Group>
-      <Table striped highlightOnHover>
-        <Table.Thead><Table.Tr><Table.Th>Name</Table.Th><Table.Th>Phase</Table.Th><Table.Th /></Table.Tr></Table.Thead>
-        <Table.Tbody>
+  const [exports, setExports] = useState<ExportItem[]>([]);
+  const [view, setView] = useState<"grid" | "table">("grid");
+  const [loaded, setLoaded] = useState(false);
+  const [drop, setDrop] = useState<string | null>(null);
+  const load = async () => {
+    const [ds, ex] = await Promise.all([
+      api<{ items: DatasetItem[] }>("/api/v1/datasets"),
+      api<{ items: ExportItem[] }>("/api/v1/exports"),
+    ]);
+    setItems(ds.items ?? []);
+    setExports(ex.items ?? []);
+    setLoaded(true);
+  };
+  useEffect(() => {
+    void load().catch((e: Error) => onNotice(e.message));
+    const id = window.setInterval(() => void load().catch(() => undefined), 3000);
+    return () => window.clearInterval(id);
+  }, []);
+  const remove = async (name: string) => {
+    try {
+      await api("/api/v1/datasets/" + encodeURIComponent(name), { method: "DELETE" });
+      await load();
+    } catch (err) {
+      onNotice(err instanceof Error ? err.message : "Could not delete the dataset");
+    }
+  };
+  const facts = (d: DatasetItem) => (
+    <>
+      <div className="meta">{countLabel(d.namespaces, "namespace", "namespaces")} · {countLabel(d.workloads, "workload", "workloads")}</div>
+      <div className="meta">
+        <span title={d.samples?.toLocaleString()}>{countLabel(d.samples, "sample", "samples")}</span>
+        {" · "}
+        <span title={d.entries?.toLocaleString()}>{countLabel(d.entries, "entry", "entries")}</span>
+      </div>
+      <div className="meta">{dayLabel(d.days)} · {intervalLabel(d.stepSeconds)}</div>
+    </>
+  );
+  const body = !loaded ? null : items.length === 0 ? (
+    <div className="center-empty">
+      <Empty title="No data is available" text="Create a dataset and it will show up here while it generates." create />
+    </div>
+  ) : view === "grid" ? (
+    <div className="ds-grid">
+      {items.map((d) => {
+        const pct = d.progress?.percent ?? 0;
+        const ph = d.phase ?? d.progress?.phase ?? "unknown";
+        const active = exporterLabel(exports.filter((e) => e.dataset === d.name));
+        return (
+          <div key={d.name} className="ds-card glass">
+            <button type="button" className="ds-open" onClick={() => openStatus(d.name)}>
+              <span className="name">{d.name}</span>
+              <div className="meta">{ph === "Queued" ? "Queued · waiting for the export to finish" : `${ph} · ${active}`}</div>
+              {facts(d)}
+              <div className="bar"><span style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} /></div>
+            </button>
+            <button type="button" className="icon-btn ds-delete" aria-label={`Delete ${d.name}`} onClick={() => setDrop(d.name)}><Icon name="trash" /></button>
+          </div>
+        );
+      })}
+    </div>
+  ) : (
+    <div className="table-wrap">
+      <table className="data">
+        <thead><tr><th>Name</th><th>Phase</th><th>Exporter</th><th>Namespaces</th><th>Workloads</th><th>Samples</th><th>Entries</th><th>Days</th><th>Interval</th><th /></tr></thead>
+        <tbody>
           {items.map((d) => (
-            <Table.Tr key={d.name}>
-              <Table.Td>{d.name}</Table.Td>
-              <Table.Td>{d.phase ?? d.progress?.phase}</Table.Td>
-              <Table.Td><Button size="xs" color="pink" onClick={async () => { await api("/api/v1/datasets/" + d.name, { method: "DELETE" }); onToast("deleting " + d.name); void load(); }}>Delete</Button></Table.Td>
-            </Table.Tr>
+            <tr key={d.name} onClick={() => openStatus(d.name)}>
+              <td>{d.name}</td>
+              <td>{(d.phase ?? d.progress?.phase) === "Queued" ? "Queued · waiting for the export" : (d.phase ?? d.progress?.phase)}</td>
+              <td>{exporterLabel(exports.filter((e) => e.dataset === d.name))}</td>
+              <td>{d.namespaces ?? "—"}</td>
+              <td>{d.workloads ?? "—"}</td>
+              <td title={d.samples?.toLocaleString()}>{d.samples == null ? "—" : shortCount(d.samples)}</td>
+              <td title={d.entries?.toLocaleString()}>{d.entries == null ? "—" : shortCount(d.entries)}</td>
+              <td>{dayLabel(d.days)}</td>
+              <td>{intervalLabel(d.stepSeconds)}</td>
+              <td>
+                <button type="button" className="icon-btn row-delete" aria-label={`Delete ${d.name}`} onClick={(e) => { e.stopPropagation(); setDrop(d.name); }}><Icon name="trash" /></button>
+              </td>
+            </tr>
           ))}
-        </Table.Tbody>
-      </Table>
-    </Stack>
+        </tbody>
+      </table>
+    </div>
+  );
+  return (
+    <div className="pane-fill">
+      <Group justify="space-between" mb="md">
+        <Title order={2}>Datasets</Title>
+        <Group gap={6}>
+          <IconButton label="Grid" pressed={view === "grid"} onClick={() => setView("grid")}><Icon name="grid" /></IconButton>
+          <IconButton label="Table" pressed={view === "table"} onClick={() => setView("table")}><Icon name="table" /></IconButton>
+        </Group>
+      </Group>
+      {body}
+      <Modal opened={drop !== null} onClose={() => setDrop(null)} title="Delete dataset" centered>
+        <Text size="sm">Remove {drop} and the data it generated?</Text>
+        <Group justify="flex-end" mt="md">
+          <Button variant="default" onClick={() => setDrop(null)}>Cancel</Button>
+          <Button color="pink" c="#1B2430" onClick={() => {
+            const name = drop;
+            setDrop(null);
+            if (name) void remove(name);
+          }}>Delete</Button>
+        </Group>
+      </Modal>
+    </div>
   );
 }
 
-function Exports({ onToast }: { onToast: (s: string) => void }) {
-  const [items, setItems] = useState<ExportItem[]>([]);
-  const [name, setName] = useState("oct");
-  const [dataset, setDataset] = useState("demo");
-  const [open, setOpen] = useState<ExportItem | null>(null);
-  const [curl, setCurl] = useState("");
-  const load = () => api<{ items: ExportItem[] }>("/api/v1/exports").then((r) => setItems(r.items ?? []));
-  useEffect(() => { void load(); }, []);
-  const create = async () => {
-    await api("/api/v1/exports", { method: "POST", body: JSON.stringify({ name, dataset, startTime: "2026-10-05T00:00:00Z" }) });
-    onToast("export " + name);
-    void load();
-  };
-  const session = async (ex: ExportItem) => {
-    const created = await api<{ sessionId: string; totals: { experiments: number; experimentPages: number; resultsPagesPerExperiment: number } }>(
-      `/api/v1/datasets/${ex.dataset}/exporters/kruize/sessions`,
-      { method: "POST", body: JSON.stringify({ name: ex.name, endTime: "2026-10-06T00:00:00Z" }) },
-    );
-    const base = `${location.origin}/api/v1/datasets/${ex.dataset}/exporters/kruize/sessions/${created.sessionId}`;
-    setCurl([
-      `curl -s '${base}/experiments?page=1&pageSize=100'`,
-      `curl -s '${base}/experiments/<experiment>/results?page=0'`,
-      `# ${created.totals.experiments} experiments, ${created.totals.experimentPages} pages, ${created.totals.resultsPagesPerExperiment} result pages`,
-    ].join("\n"));
-    setOpen(ex);
-  };
-  return (
-    <Stack>
-      <Title order={2} c="#F7F8FB">Exports</Title>
-      <Group align="end">
-        <TextInput label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} />
-        <TextInput label="Dataset" value={dataset} onChange={(e) => setDataset(e.currentTarget.value)} />
-        <Button color="mint" c="#1F2A3A" onClick={() => void create()}>Build</Button>
-      </Group>
-      <Table>
-        <Table.Thead><Table.Tr><Table.Th>Name</Table.Th><Table.Th>Phase</Table.Th><Table.Th>Blocks</Table.Th><Table.Th>Route</Table.Th><Table.Th /></Table.Tr></Table.Thead>
-        <Table.Tbody>
-          {items.map((ex) => (
-            <Table.Tr key={ex.name}>
-              <Table.Td>{ex.name}</Table.Td>
-              <Table.Td>{ex.phase}</Table.Td>
-              <Table.Td>{ex.blocks ?? 0}</Table.Td>
-              <Table.Td>{ex.url ? <a href={ex.url} style={{ color: "#7DCCAD" }}>{ex.url}</a> : "—"}</Table.Td>
-              <Table.Td><Button size="xs" onClick={() => void session(ex)}>Session</Button></Table.Td>
-            </Table.Tr>
-          ))}
-        </Table.Tbody>
-      </Table>
-      <Modal opened={open !== null} onClose={() => setOpen(null)} title="Kruize session">
-        <Code block>{curl}</Code>
-      </Modal>
-    </Stack>
-  );
+function gib(n: number): string {
+  return (n / 1024 ** 3).toFixed(3);
 }
 
 function Storage() {
   const [view, setView] = useState<StorageView | null>(null);
   useEffect(() => { void api<StorageView>("/api/v1/storage").then(setView); }, []);
-  const cap = view?.capacityBytes ?? 750 * 1024 * 1024 * 1024;
+  const cap = view?.capacityBytes ?? 1500 * 1024 * 1024 * 1024;
   const used = view?.usedBytes ?? 0;
   const pct = cap ? (used / cap) * 100 : 0;
+  const empty = (view?.datasets ?? []).length === 0 && view;
   return (
-    <Stack>
-      <Title order={2} c="#F7F8FB">Storage</Title>
-      <Card withBorder>
-        <Text c="#F7F8FB">kubegenx-data · {(used / (1024 ** 3)).toFixed(3)} GiB of {(cap / (1024 ** 3)).toFixed(0)} GiB</Text>
+    <div className="pane-fill">
+      <Title order={2} mb="md">Storage</Title>
+      <div className="glass" style={{ borderRadius: 18, padding: 16 }}>
+        <Text>kubegenx-data · {(used / (1024 ** 3)).toFixed(3)} GiB of {(cap / (1024 ** 3)).toFixed(0)} GiB</Text>
         <Progress value={pct} color="pink" mt="sm" />
-      </Card>
-      <Table>
-        <Table.Thead><Table.Tr><Table.Th>Dataset</Table.Th><Table.Th>Phase</Table.Th><Table.Th>Bytes</Table.Th><Table.Th>Reserved</Table.Th></Table.Tr></Table.Thead>
-        <Table.Tbody>
-          {(view?.datasets ?? []).map((d) => (
-            <Table.Tr key={d.name}><Table.Td>{d.name}</Table.Td><Table.Td>{d.phase}</Table.Td><Table.Td>{d.bytes}</Table.Td><Table.Td>{d.reserved}</Table.Td></Table.Tr>
-          ))}
-        </Table.Tbody>
-      </Table>
-    </Stack>
-  );
-}
-
-function Sessions() {
-  const [dataset, setDataset] = useState("demo");
-  const [rows, setRows] = useState<{ id: string; endTime: string; closed: boolean }[]>([]);
-  const [page, setPage] = useState(1);
-  const load = () => api<{ items: { id: string; endTime: string; closed: boolean }[] }>(`/api/v1/datasets/${dataset}/exporters/kruize/sessions`).then((r) => setRows(r.items ?? []));
-  const pageSize = 10;
-  const slice = rows.slice((page - 1) * pageSize, page * pageSize);
-  return (
-    <Stack>
-      <Title order={2} c="#F7F8FB">Kruize sessions</Title>
-      <Group>
-        <TextInput label="Dataset" value={dataset} onChange={(e) => setDataset(e.currentTarget.value)} />
-        <Button mt={24} onClick={() => void load()}>Load</Button>
-      </Group>
-      <Table>
-        <Table.Thead><Table.Tr><Table.Th>Session</Table.Th><Table.Th>End</Table.Th><Table.Th>Closed</Table.Th><Table.Th>Curl</Table.Th></Table.Tr></Table.Thead>
-        <Table.Tbody>
-          {slice.map((s) => (
-            <Table.Tr key={s.id}>
-              <Table.Td>{s.id}</Table.Td>
-              <Table.Td>{s.endTime}</Table.Td>
-              <Table.Td>{String(s.closed)}</Table.Td>
-              <Table.Td><Code>{`curl -s '${location.origin}/api/v1/datasets/${dataset}/exporters/kruize/sessions/${s.id}/experiments?page=1&pageSize=100'`}</Code></Table.Td>
-            </Table.Tr>
-          ))}
-        </Table.Tbody>
-      </Table>
-      <Group>
-        <Button variant="default" disabled={page <= 1} onClick={() => setPage(page - 1)}>Prev</Button>
-        <Text c="#F7F8FB">page {page}</Text>
-        <Button variant="default" disabled={page * pageSize >= rows.length} onClick={() => setPage(page + 1)}>Next</Button>
-      </Group>
-    </Stack>
+      </div>
+      {empty ? (
+        <div className="center-empty">
+          <Empty title="No data is available" text="The volume stays empty until a dataset is created." create />
+        </div>
+      ) : view ? (
+        <div className="table-wrap" style={{ marginTop: 14 }}>
+          <table className="data">
+            <thead><tr><th>Dataset</th><th>Phase</th><th>GiB</th><th>Reserved GiB</th></tr></thead>
+            <tbody>
+              {(view.datasets ?? []).map((d) => (
+                <tr key={d.name}><td>{d.name}</td><td>{d.phase}</td><td>{gib(d.bytes)}</td><td>{gib(d.reserved)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
   );
 }

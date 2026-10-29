@@ -75,6 +75,35 @@ subjects:
     name: kubegenx-controller
     namespace: kube-gen-x
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubegenx-controller-capacity
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubegenx-controller-capacity
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubegenx-controller-capacity
+subjects:
+  - kind: ServiceAccount
+    name: kubegenx-controller
+    namespace: kube-gen-x
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -142,7 +171,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: quay.io/bharathappali/kube-gen-x:controller-v0.1.0
+          image: quay.io/bharathappali/kube-gen-x:controller-v0.1.1
           imagePullPolicy: Always
           env:
             - name: POD_NAMESPACE
@@ -158,9 +187,11 @@ spec:
             - name: TMPDIR
               value: /scratch
             - name: GOMEMLIMIT
-              value: 7200MiB
+              value: 7GiB
             - name: KUBEGENX_WORKER_IMAGE
-              value: quay.io/bharathappali/kube-gen-x:worker-v0.1.0
+              value: quay.io/bharathappali/kube-gen-x:worker-v0.1.1
+            - name: KUBEGENX_CONVERTER_IMAGE
+              value: quay.io/bharathappali/kube-gen-x:converter-v0.1.1
             - name: KUBEGENX_THANOS_IMAGE
               value: quay.io/thanos/thanos:v0.42.4
             - name: KUBEGENX_POD_UID

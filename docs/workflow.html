@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KubeGenX — generate once, serve any timeline</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%23F599C6'/%3E%3Cstop offset='1' stop-color='%237DCCAD'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --pink: #F599C6;
+  --butter: #FFEA88;
+  --mint: #7DCCAD;
+  --slate: #4D6787;
+  --bg: #101820;
+  --ink: #F4F7FB;
+  --ink-2: #D5DEE8;
+  --ink-3: #93A4B8;
+  --glass: rgba(28, 44, 62, 0.74);
+  --glass-strong: rgba(24, 38, 54, 0.88);
+  --glass-soft: rgba(255, 255, 255, 0.06);
+  --glass-border: rgba(255, 255, 255, 0.16);
+  --hairline: rgba(255, 255, 255, 0.1);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.28), 0 16px 40px rgba(0, 0, 0, 0.28);
+  --rim: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  --r-lg: 18px;
+  --r-md: 12px;
+  --r-pill: 999px;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: Quicksand, ui-rounded, system-ui, sans-serif;
+  font-weight: 500;
+  color: var(--ink);
+  background-color: color-mix(in srgb, var(--slate) 42%, var(--bg));
+  background-image:
+    radial-gradient(ellipse 95% 80% at -5% -8%, color-mix(in srgb, var(--pink) 72%, transparent), transparent 62%),
+    radial-gradient(ellipse 90% 75% at 108% -6%, color-mix(in srgb, var(--butter) 58%, transparent), transparent 64%),
+    radial-gradient(ellipse 95% 85% at 110% 108%, color-mix(in srgb, var(--mint) 64%, transparent), transparent 62%),
+    radial-gradient(ellipse 90% 80% at -8% 110%, color-mix(in srgb, var(--slate) 86%, transparent), transparent 64%),
+    radial-gradient(ellipse 70% 60% at 38% 42%, color-mix(in srgb, var(--pink) 34%, var(--butter)), transparent 70%),
+    radial-gradient(ellipse 65% 55% at 68% 62%, color-mix(in srgb, var(--mint) 38%, var(--butter)), transparent 68%);
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  background-size: 150% 150%;
+  animation: wash 32s ease-in-out infinite alternate;
+  -webkit-font-smoothing: antialiased;
+}
+@keyframes wash {
+  from { background-position: 0% 0%, 100% 0%, 100% 100%, 0% 100%, 30% 35%, 70% 60%; }
+  to { background-position: 12% 8%, 86% 10%, 90% 88%, 8% 92%, 55% 48%, 58% 72%; }
+}
+:focus-visible { outline: 2px solid var(--butter); outline-offset: 3px; }
+.wrap {
+  width: min(1120px, calc(100% - 28px));
+  margin: 16px auto 56px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.glass {
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow), var(--rim);
+  -webkit-backdrop-filter: blur(22px) saturate(160%);
+  backdrop-filter: blur(22px) saturate(160%);
+}
+.topbar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: stretch;
+  gap: 10px;
+}
+.tb-card {
+  border-radius: var(--r-lg);
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.brand-card { padding: 0 18px; gap: 10px; justify-self: start; height: 56px; }
+.brand-mark {
+  width: 28px; height: 28px; border-radius: 9px; flex: none;
+  background: linear-gradient(135deg, var(--pink), var(--mint));
+}
+.brand {
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: -0.2px;
+  background: linear-gradient(90deg, var(--butter), var(--pink));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.tab-card {
+  width: max-content;
+  max-width: 100%;
+  padding: 6px;
+  gap: 4px;
+  justify-self: center;
+  height: 56px;
+}
+.tab-card a {
+  display: flex;
+  align-items: center;
+  border-radius: var(--r-pill);
+  padding: 8px 16px;
+  color: var(--ink-2);
+  font-weight: 700;
+  text-decoration: none;
+}
+.tab-card a:hover { background: var(--glass-soft); color: var(--ink); }
+.right-card { padding: 0 12px; justify-self: end; height: 56px; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-soft);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.chip .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--mint);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--mint) 28%, transparent);
+}
+section, .hinge { scroll-margin-top: 16px; }
+.hero, .studio, .hinge, .flow, .choices-wrap, .series-wrap {
+  border-radius: var(--r-lg);
+  padding: 22px;
+}
+.kicker {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--mint);
+}
+h1 {
+  margin: 0 0 12px;
+  font-size: clamp(32px, 5vw, 46px);
+  line-height: 1.05;
+  letter-spacing: -0.6px;
+  font-weight: 700;
+}
+h2 { margin: 0 0 6px; font-size: 22px; letter-spacing: -0.2px; }
+h3 { margin: 0; font-size: 16px; }
+.lede { margin: 0; max-width: 68ch; color: var(--ink-2); font-size: 16.5px; line-height: 1.5; }
+.points {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.points li {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  background: var(--glass-soft);
+  border: 1px solid var(--hairline);
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.45;
+}
+.points strong { display: block; color: var(--ink); margin-bottom: 2px; }
+
+.studio-head { display: flex; justify-content: space-between; gap: 18px; align-items: flex-end; }
+.studio-head p { margin: 0; color: var(--ink-2); max-width: 62ch; font-size: 14.5px; line-height: 1.45; }
+.big-date {
+  margin: 0;
+  font-size: clamp(28px, 4vw, 36px);
+  font-weight: 700;
+  letter-spacing: -0.4px;
+  font-variant-numeric: tabular-nums;
+  background: linear-gradient(90deg, var(--butter), var(--pink));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-align: right;
+  line-height: 1.1;
+}
+.offset-line {
+  margin: 4px 0 0;
+  color: var(--ink-3);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.strip-scroll { margin-top: 18px; overflow-x: auto; }
+.days {
+  display: grid;
+  grid-template-columns: repeat(15, minmax(56px, 1fr));
+  gap: 6px;
+  min-width: 860px;
+}
+.day { min-width: 0; }
+.spike-mark {
+  display: block;
+  height: 14px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--pink);
+  text-align: center;
+}
+.bars {
+  height: 72px;
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  padding: 6px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--hairline);
+}
+.bars span {
+  flex: 1;
+  border-radius: 3px 3px 2px 2px;
+  min-height: 4px;
+}
+.day time {
+  display: block;
+  margin-top: 6px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.caption { margin: 8px 0 0; color: var(--ink-3); font-size: 12.5px; }
+.slider-row { margin-top: 16px; }
+.slider-row label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 8px;
+}
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: var(--r-pill);
+  background:
+    linear-gradient(90deg, var(--mint), var(--butter)) 0 / var(--p, 50%) 100% no-repeat,
+    rgba(255, 255, 255, 0.12);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 22px;
+  height: 22px;
+  margin-top: -7px;
+  border: 0;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--pink), var(--butter));
+  box-shadow: 0 0 0 4px rgba(16, 24, 32, 0.45);
+}
+input[type="range"]::-moz-range-track {
+  height: 8px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.12);
+}
+input[type="range"]::-moz-range-progress {
+  height: 8px;
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--mint), var(--butter));
+}
+input[type="range"]::-moz-range-thumb {
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--pink), var(--butter));
+}
+.presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.presets button {
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-pill);
+  padding: 8px 14px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  background: var(--glass-soft);
+  color: var(--ink-2);
+}
+.presets button:hover { color: var(--ink); }
+.presets button[aria-pressed="true"] {
+  color: #1B2430;
+  background: linear-gradient(135deg, var(--pink), var(--butter));
+  border-color: transparent;
+}
+.formula {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--hairline);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  color: var(--butter);
+  font-variant-numeric: tabular-nums;
+}
+.doors {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 14px;
+}
+.door {
+  border-radius: var(--r-md);
+  padding: 14px 14px 14px 16px;
+  background: var(--glass-strong);
+  border: 1px solid var(--glass-border);
+}
+.door.thanos { box-shadow: inset 3px 0 0 var(--mint); }
+.door.kruize { box-shadow: inset 3px 0 0 var(--pink); }
+.door .tag {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.door.thanos .tag { color: var(--mint); }
+.door.kruize .tag { color: var(--pink); }
+.door h3 { margin: 4px 0 6px; }
+.door .when {
+  margin: 0 0 6px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+}
+.door p { margin: 0; color: var(--ink-2); font-size: 13.5px; line-height: 1.45; }
+.door code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--butter);
+}
+
+.hinge { display: grid; grid-template-columns: 1.1fr 1.4fr; gap: 18px; align-items: center; }
+.fn {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: clamp(15px, 2vw, 18px);
+  font-weight: 600;
+  color: var(--butter);
+}
+.hinge ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.hinge li {
+  padding-left: 14px;
+  border-left: 3px solid var(--mint);
+  color: var(--ink-2);
+  font-size: 14.5px;
+  line-height: 1.4;
+}
+.hinge li:nth-child(2) { border-color: var(--butter); }
+.hinge li:nth-child(3) { border-color: var(--pink); }
+
+.flow h2, .choices-wrap h2, .series-wrap h2 { margin-bottom: 4px; }
+.flow > .lede, .choices-wrap > .lede, .series-wrap > .lede { margin-bottom: 16px; font-size: 14.5px; }
+.pipe {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 22px;
+}
+.node { position: relative; border-radius: var(--r-md); padding: 14px; background: var(--glass-soft); border: 1px solid var(--hairline); }
+.pipe .node:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  right: -15px;
+  top: 22px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--butter);
+  border-top: 2px solid var(--butter);
+  transform: rotate(45deg);
+}
+.node-top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.num {
+  width: 26px; height: 26px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  font-size: 13px;
+  font-weight: 700;
+  color: #1B2430;
+  background: linear-gradient(135deg, var(--pink), var(--butter));
+}
+.node p { margin: 0; color: var(--ink-2); font-size: 13.5px; line-height: 1.45; }
+.viz { margin-top: 12px; }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pills span, .tree, .cols {
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--hairline);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+.pills span { padding: 4px 8px; border-radius: var(--r-pill); }
+.tree { list-style: none; margin: 0; padding: 8px 10px; border-radius: 12px; font-weight: 600; }
+.tree ul { list-style: none; margin: 4px 0 0; padding-left: 12px; border-left: 2px solid color-mix(in srgb, var(--mint) 50%, transparent); }
+.tree li { margin: 2px 0; }
+.tree em { display: block; font-style: normal; color: var(--ink-3); font-weight: 600; font-size: 11px; }
+.cells { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; }
+.cells i { display: block; aspect-ratio: 1; border-radius: 50%; background: var(--mint); }
+.cells i:nth-child(n+17) { background: var(--butter); }
+.cells i:nth-child(19) { background: var(--pink); }
+.cells i:nth-child(n+21) { background: color-mix(in srgb, var(--slate) 55%, transparent); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-top: 8px; color: var(--ink-3); font-size: 11px; font-weight: 700; }
+.legend b { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+.cols { display: grid; gap: 4px; padding: 8px 10px; border-radius: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 500; font-size: 11px; }
+.cols div { display: flex; justify-content: space-between; gap: 8px; }
+.cols b { color: var(--ink-3); font-weight: 600; }
+.file {
+  margin-top: 6px;
+  color: var(--ink-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.fork-label {
+  margin: 16px 0 8px;
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.fork { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; position: relative; }
+.fork::before {
+  content: "";
+  position: absolute;
+  top: -14px;
+  left: 18%;
+  right: 18%;
+  height: 14px;
+  border: 2px solid rgba(255, 234, 136, 0.45);
+  border-bottom: 0;
+  border-radius: 14px 14px 0 0;
+}
+.choices {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.choice {
+  border-radius: var(--r-md);
+  padding: 16px;
+  background: var(--glass-soft);
+  border: 1px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+}
+.choice:nth-child(3n+2) .kicker { color: var(--butter); }
+.choice:nth-child(3n) .kicker { color: var(--pink); }
+.choice p { margin: 8px 0 0; color: var(--ink-2); font-size: 14px; line-height: 1.45; }
+.because {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+  color: var(--ink);
+  font-weight: 650;
+  font-size: 13.5px;
+}
+.series {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.series li {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px;
+  border-radius: var(--r-md);
+  background: var(--glass-soft);
+  border: 1px solid var(--hairline);
+}
+.swatch { width: 10px; height: 10px; border-radius: 50%; margin-top: 5px; flex: none; }
+.swatch.mint { background: var(--mint); }
+.swatch.butter { background: var(--butter); }
+.swatch.pink { background: var(--pink); }
+.swatch.slate { background: var(--slate); box-shadow: inset 0 0 0 1px rgba(255,255,255,.3); }
+.series strong { display: block; font-size: 14.5px; }
+.series span { color: var(--ink-2); font-size: 13.5px; line-height: 1.4; }
+.foot { color: var(--ink-3); font-size: 12.5px; text-align: center; padding: 4px 8px 0; }
+@media (max-width: 980px) {
+  .points, .choices, .hinge { grid-template-columns: 1fr; }
+  .pipe { grid-template-columns: 1fr 1fr; gap: 12px; }
+  .pipe .node::after, .fork::before { display: none; }
+  .big-date, .offset-line { text-align: left; }
+  .studio-head { flex-direction: column; align-items: flex-start; }
+}
+@media (max-width: 760px) {
+  .topbar { grid-template-columns: 1fr; }
+  .brand-card, .tab-card, .right-card { justify-self: stretch; }
+  .right-card { display: none; }
+  .tab-card { width: auto; overflow-x: auto; }
+  .doors, .fork, .series, .pipe { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  body { animation: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="topbar">
+    <div class="brand-card glass tb-card">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand">KubeGenX</span>
+    </div>
+    <nav class="tab-card glass tb-card" aria-label="On this page">
+      <a href="#why">Why</a>
+      <a href="#clock">Shift</a>
+      <a href="#workflow">Workflow</a>
+      <a href="#choices">Choices</a>
+    </nav>
+    <div class="right-card glass tb-card">
+      <span class="chip"><span class="dot"></span>Generate once</span>
+    </div>
+  </header>
+
+  <section class="hero glass" id="why">
+    <p class="kicker">Why KubeGenX exists</p>
+    <h1>Generate once. Serve any timeline.</h1>
+    <p class="lede">KubeGenX builds the usage history Thanos would hold for a real Kubernetes cluster, then lets you place that history on any calendar. The samples are created a single time. A new end time becomes a new Thanos, or a Kruize feed, over the same files.</p>
+    <ul class="points">
+      <li><strong>Real series.</strong> Container CPU and memory, kube-state-metrics, GPU metrics, and the recorded rates Kruize and OpenShift expect.</li>
+      <li><strong>Built a single time.</strong> The usage pattern belongs to the workload. Which week it appears on is chosen when you serve. A full-size run is on the order of a hundred billion samples.</li>
+      <li><strong>Served on demand.</strong> Ask for an end time. Thanos gets blocks for that window. Kruize gets JSON pages stamped with that window, built as each page is requested.</li>
+    </ul>
+  </section>
+
+  <section class="studio glass" id="clock">
+    <div class="studio-head">
+      <div>
+        <p class="kicker">The idea</p>
+        <h2>Same samples. Move the calendar.</h2>
+        <p>Fifteen days, in six-hour chunks. The bars are the dataset. Drag where that dataset ends, and only the dates change.</p>
+      </div>
+      <div>
+        <p class="big-date" id="endDate">22 Oct 2026</p>
+        <p class="offset-line" id="offsetLine"></p>
+      </div>
+    </div>
+    <div class="strip-scroll">
+      <div class="days" id="days"></div>
+    </div>
+    <p class="caption">The pink spike is stored in the dataset. Slide the calendar and it lands on a different day. The files stay as they are.</p>
+    <div class="slider-row">
+      <label for="shift"><span>End this dataset on</span><span id="sliderReadout"></span></label>
+      <input id="shift" type="range" min="-45" max="60" value="15" step="1">
+    </div>
+    <div class="presets" role="group" aria-label="Preset end dates">
+      <button type="button" data-offset="0">As generated</button>
+      <button type="button" data-offset="15">Today</button>
+      <button type="button" data-offset="-30">Month earlier</button>
+      <button type="button" data-offset="30">Month later</button>
+    </div>
+    <p class="formula" id="formula"></p>
+    <div class="doors">
+      <article class="door thanos">
+        <div class="tag">Thanos export</div>
+        <h3>Blocks for this window</h3>
+        <p class="when" id="thanosWhen"></p>
+        <p>The controller writes TSDB blocks with these timestamps and starts a store gateway, querier and route. Point Kruize local monitoring, or any PromQL client, at that Thanos. Another end time is another export, with its own blocks.</p>
+      </article>
+      <article class="door kruize">
+        <div class="tag">Kruize session</div>
+        <h3>Pages, stamped as they are served</h3>
+        <p class="when" id="kruizeWhen"></p>
+        <p>Experiment and result JSON are built when requested, with this offset. The experiment name stays <code>dataset|namespace|kind|workload</code>. Give each timeline its own Kruize so the histories stay apart.</p>
+      </article>
+    </div>
+  </section>
+
+  <aside class="hinge glass">
+    <div>
+      <p class="kicker">What makes the split possible</p>
+      <p class="fn">sample = f(seed, container, metric, chunk, step)</p>
+    </div>
+    <ul>
+      <li>Any chunk can be generated first. Workers never need the previous chunk on disk.</li>
+      <li>A retry writes the identical file. A lost pod only repeats the batches it held.</li>
+      <li>The timestamp is applied by whoever is serving, from the offset fixed for that export or session.</li>
+    </ul>
+  </aside>
+
+  <section class="flow glass" id="workflow">
+    <p class="kicker">Workflow</p>
+    <h2>From a scenario to a clock</h2>
+    <p class="lede">One namespace, <code style="color:var(--butter)">kube-gen-x</code>. A Go controller plans and leases. Rust workers write parquet. Thanos and Kruize are the two ways out.</p>
+    <div class="pipe">
+      <article class="node">
+        <div class="node-top"><span class="num">1</span><h3>Describe</h3></div>
+        <p>A template is the scenario: size, GPU share, replica mix, usage bands, labels and a seed. The same template and seed reproduce the same cluster.</p>
+        <div class="viz pills" aria-hidden="true">
+          <span>12 namespaces</span>
+          <span>400 workloads</span>
+          <span>8% GPU</span>
+          <span>seed 7f3a</span>
+        </div>
+      </article>
+      <article class="node">
+        <div class="node-top"><span class="num">2</span><h3>Plan</h3></div>
+        <p>The controller expands that into namespaces, workloads, pods, containers and nodes before the first sample. Ownership and requests live here, and later joins read them from here.</p>
+        <ul class="viz tree" aria-hidden="true">
+          <li>asia-india
+            <ul>
+              <li>mumbai-worker <em>deployment · 3 replicas</em></li>
+              <li>pune-db <em>statefulset · 1 replica</em></li>
+            </ul>
+          </li>
+        </ul>
+      </article>
+      <article class="node">
+        <div class="node-top"><span class="num">3</span><h3>Generate</h3></div>
+        <p>Work is a grid of 6-hour chunks. Workers lease batches, run them in parallel, and write one parquet file each. A stored counter offset keeps the series continuous when chunks are read in order.</p>
+        <div class="viz">
+          <div class="cells" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </div>
+          <div class="legend" aria-hidden="true">
+            <span><b style="background:var(--mint)"></b>done</span>
+            <span><b style="background:var(--butter)"></b>running</span>
+            <span><b style="background:var(--pink)"></b>retry</span>
+            <span><b style="background:var(--slate)"></b>waiting</span>
+          </div>
+        </div>
+      </article>
+      <article class="node">
+        <div class="node-top"><span class="num">4</span><h3>Keep</h3></div>
+        <p>Parquet on one shared volume is the copy that lasts. Time is a step index from the dataset epoch. Exports are other directories and can come and go.</p>
+        <div class="viz cols" aria-hidden="true">
+          <div><b>ctr_id</b><span>18421</span></div>
+          <div><b>step_idx</b><span>10082</span></div>
+          <div><b>usage_us</b><span>Δ 14021</span></div>
+        </div>
+        <div class="file">feature=cpu/chunk=0007/<br>item-000042.parquet</div>
+      </article>
+    </div>
+    <p class="fork-label">Then choose a clock. The parquet stays put.</p>
+    <div class="fork">
+      <article class="door thanos">
+        <div class="tag">5a · Thanos</div>
+        <h3>Materialize a timeline</h3>
+        <p>Pick an end time. The controller reads the parquet, stamps the offset, writes 24-hour TSDB blocks sharded by series, and adds the Thanos metadata. A private store and querier serve that directory on a route.</p>
+      </article>
+      <article class="door kruize">
+        <div class="tag">5b · Kruize remote</div>
+        <h3>Serve a timeline live</h3>
+        <p>Open a session with an end time. The offset is fixed for the life of the session. Experiment pages come from the plan. Each results page is one 6-hour chunk, aggregated when that page is requested. Several sessions can be open on different clocks.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="choices-wrap glass" id="choices">
+    <p class="kicker">Design choices</p>
+    <h2>Why it is built this way</h2>
+    <p class="lede">Short reasons for the pieces that make “generate once, serve many clocks” practical at cluster scale.</p>
+    <div class="choices">
+      <article class="choice">
+        <p class="kicker">Format</p>
+        <h3>Parquet holds the samples</h3>
+        <p>Labels live in the plan. Sample files hold an id, a step index and integers, packed as deltas and compressed to a few bytes per sample. One file is a workload batch for one 6-hour chunk, so a page or a block window opens only the files it needs.</p>
+        <p class="because">Columnar files can be pruned by workload and time, and both the block writer and DuckDB read them in place.</p>
+      </article>
+      <article class="choice">
+        <p class="kicker">Scale</p>
+        <h3>Generation is a queue of chunks</h3>
+        <p>Rust workers lease a batch from the controller over gRPC and use every core. They keep nothing locally. The output path is computed from the batch id, so a completed file is simply the file at that path. Worker jobs leave when the dataset is done.</p>
+        <p class="because">A hundred billion samples only works as parallel, restartable work. A lost pod costs the in-flight batches, redone identically.</p>
+      </article>
+      <article class="choice">
+        <p class="kicker">Time</p>
+        <h3>A step index, then an offset</h3>
+        <p>Samples remember how many 15-second steps they sit from the dataset epoch. Serving floors the chosen end to 15 minutes and sets the offset against the original end. Exports and sessions remember the offset they were opened with, so a long paginated read never slides.</p>
+        <p class="because">Moving a timeline changes a parameter. The expensive files stay where they were written.</p>
+      </article>
+      <article class="choice">
+        <p class="kicker">Shape</p>
+        <h3>Rates and ownership are derived</h3>
+        <p>kube-state-metrics is stored as intervals and expanded to a 30-second series while serving. The recorded CPU series — sum_irate, sum_rate5m and sum_rate — are computed from the counter in that same pass. Memory and GPU gauges are generated with the container samples.</p>
+        <p class="because">Written as raw samples, the mapping series alone would outweigh everything else. The dataset keeps the signal that actually varies.</p>
+      </article>
+      <article class="choice">
+        <p class="kicker">State</p>
+        <h3>SQLite for churn, DuckDB for scans</h3>
+        <p>Leases, retries, progress and sessions are small transactional rows in SQLite. DuckDB scans the parquet in place for Kruize pages, storage totals and expected values. Templates, datasets and exports are ConfigMaps in <code style="color:var(--butter)">kube-gen-x</code>, so install stays inside one namespace.</p>
+        <p class="because">Tiny writes and columnar reads are different jobs. Each has an embedded engine, and the cluster’s own monitoring is left alone.</p>
+      </article>
+      <article class="choice">
+        <p class="kicker">Serving</p>
+        <h3>One Thanos per timeline</h3>
+        <p>PromQL needs real blocks. The controller writes them directly from parquet, in 24-hour windows split by series so memory stays bounded, and records a Thanos section in meta.json. That export mounts its block directory as a filesystem bucket and runs its own store and querier.</p>
+        <p class="because">Each shift is a Thanos you can query today. A second shift gets its own blocks, so two clocks never share a history.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="series-wrap glass" id="series">
+    <p class="kicker">What a query finds</p>
+    <h2>The series Thanos ends up serving</h2>
+    <p class="lede">Enough for Kruize metadata, Kruize recommendations and the OpenShift recording rules to behave as they would on a live cluster.</p>
+    <ul class="series">
+      <li><span class="swatch mint"></span><div><strong>Container CPU and memory</strong><span>cAdvisor counters and gauges, every 15 seconds, with the usual kubelet labels.</span></div></li>
+      <li><span class="swatch butter"></span><div><strong>kube-state-metrics</strong><span>Pod, owner, replica-set and container mapping series, expanded from intervals at 30 seconds so the joins resolve.</span></div></li>
+      <li><span class="swatch pink"></span><div><strong>Recorded CPU rates</strong><span>sum_irate, sum_rate5m and sum_rate, computed from the counter while the blocks or the result page are produced.</span></div></li>
+      <li><span class="swatch slate"></span><div><strong>GPU metrics</strong><span>DCGM-style series for the workloads that were planned with a GPU, on the same step as the container data.</span></div></li>
+    </ul>
+  </section>
+
+  <p class="foot">Times in the demo are UTC midnight. A real export or session floors the end to 15 minutes and keeps that offset until you close it.</p>
+</div>
+<script>
+(function () {
+  var DAYS = 15;
+  var DAY = 86400000;
+  var ORIGIN_END = Date.UTC(2026, 9, 7);
+  var MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  var daysEl = document.getElementById("days");
+  var input = document.getElementById("shift");
+  var presets = document.querySelectorAll("[data-offset]");
+
+  function fmt(ms) {
+    var d = new Date(ms);
+    return d.getUTCDate() + " " + MON[d.getUTCMonth()];
+  }
+  function fmtFull(ms) {
+    var d = new Date(ms);
+    return d.getUTCDate() + " " + MON[d.getUTCMonth()] + " " + d.getUTCFullYear();
+  }
+  function height(day, chunk) {
+    if (day === 9 && chunk === 2) return 100;
+    var hour = chunk * 6 + 3;
+    var diurnal = 0.45 + 0.34 * Math.sin(((hour - 8) / 24) * Math.PI * 2);
+    var wobble = 0.06 * Math.sin(day * 1.7 + chunk);
+    return Math.round(Math.min(88, Math.max(16, (diurnal + wobble) * 100)));
+  }
+  function color(day, chunk, h) {
+    if (day === 9 && chunk === 2) return "var(--pink)";
+    if (h > 68) return "var(--butter)";
+    if (h > 42) return "var(--mint)";
+    return "color-mix(in srgb, var(--slate) 70%, var(--mint))";
+  }
+
+  for (var day = 0; day < DAYS; day++) {
+    var cell = document.createElement("div");
+    cell.className = "day";
+    var mark = document.createElement("span");
+    mark.className = "spike-mark";
+    mark.textContent = day === 9 ? "spike" : "";
+    var bars = document.createElement("div");
+    bars.className = "bars";
+    for (var chunk = 0; chunk < 4; chunk++) {
+      var h = height(day, chunk);
+      var bar = document.createElement("span");
+      bar.style.height = h + "%";
+      bar.style.background = color(day, chunk, h);
+      bars.appendChild(bar);
+    }
+    var time = document.createElement("time");
+    cell.appendChild(mark);
+    cell.appendChild(bars);
+    cell.appendChild(time);
+    daysEl.appendChild(cell);
+  }
+
+  function render(offsetDays) {
+    var end = ORIGIN_END + offsetDays * DAY;
+    var start = end - DAYS * DAY;
+    var times = daysEl.querySelectorAll("time");
+    for (var i = 0; i < DAYS; i++) times[i].textContent = fmt(start + i * DAY);
+    var endLabel = fmtFull(end);
+    document.getElementById("endDate").textContent = endLabel;
+    var steps = Math.abs(offsetDays) * 5760;
+    var seconds = Math.abs(offsetDays) * 86400;
+    var sign = offsetDays > 0 ? "+" : offsetDays < 0 ? "−" : "";
+    document.getElementById("offsetLine").textContent = offsetDays === 0
+      ? "Offset 0 · timestamps match the dataset epoch"
+      : "Offset " + sign + Math.abs(offsetDays) + " days · " + sign + seconds.toLocaleString("en-US") + " s";
+    document.getElementById("sliderReadout").textContent = endLabel;
+    input.setAttribute("aria-valuetext", endLabel);
+    var span = Number(input.max) - Number(input.min);
+    input.style.setProperty("--p", ((offsetDays - Number(input.min)) / span * 100) + "%");
+    var windowText = fmtFull(start) + " → " + endLabel + " UTC";
+    document.getElementById("thanosWhen").textContent = windowText;
+    document.getElementById("kruizeWhen").textContent = windowText;
+    var offSec = offsetDays * 86400;
+    var offTxt = offSec === 0 ? "0" : (offSec > 0 ? "+" : "−") + Math.abs(offSec).toLocaleString("en-US") + "s";
+    document.getElementById("formula").textContent =
+      "t′ = epoch + (" + offTxt + ") + step × 15s    ·    " + steps.toLocaleString("en-US") + " steps from the generated end";
+    presets.forEach(function (btn) {
+      btn.setAttribute("aria-pressed", String(Number(btn.getAttribute("data-offset")) === offsetDays));
+    });
+  }
+
+  input.addEventListener("input", function () { render(Number(input.value)); });
+  presets.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      input.value = btn.getAttribute("data-offset");
+      render(Number(input.value));
+    });
+  });
+  render(Number(input.value));
+})();
+</script>
+</body>
+</html>

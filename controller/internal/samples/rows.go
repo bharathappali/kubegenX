@@ -2,6 +2,7 @@
 package samples
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,33 @@ type GPURow struct {
 	Util     uint8  `parquet:"util"`
 	MemCopy  uint8  `parquet:"memcopy"`
 	FBUsed   uint32 `parquet:"fb_used_mib"`
+}
+
+// ItemFile is one work-item Parquet file: a workload range inside one 6h chunk.
+func ItemFile(dir, feature string, chunk, index int) string {
+	return filepath.Join(dir, "samples", "feature="+feature, fmt.Sprintf("chunk=%04d", chunk), fmt.Sprintf("item-%06d.parquet", index))
+}
+
+func ReadCPUFile(path string) ([]CPURow, error) {
+	return readFile[CPURow](path)
+}
+
+func ReadMemFile(path string) ([]MemRow, error) {
+	return readFile[MemRow](path)
+}
+
+func ReadGPUFile(path string) ([]GPURow, error) {
+	return readFile[GPURow](path)
+}
+
+func readFile[T any](path string) ([]T, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return parquet.ReadFile[T](path)
 }
 
 func ReadCPU(dir string) ([]CPURow, error) {

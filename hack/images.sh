@@ -36,6 +36,7 @@ push_one() {
 }
 
 push_one controller docker/controller.Dockerfile
+push_one converter docker/converter.Dockerfile
 push_one worker docker/worker.Dockerfile
 push_one tools docker/tools.Dockerfile
 if [[ "${SKIP_PUSH:-}" == "1" ]]; then

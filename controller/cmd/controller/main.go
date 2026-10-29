@@ -44,6 +44,7 @@ func main() {
 	httpAddr := env("HTTP_ADDR", ":8080")
 	grpcAddr := env("GRPC_ADDR", ":9091")
 	workerImage := env("KUBEGENX_WORKER_IMAGE", "quay.io/bharathappali/kube-gen-x:worker-v0.1.0")
+	converterImage := env("KUBEGENX_CONVERTER_IMAGE", "quay.io/bharathappali/kube-gen-x:converter-v0.1.0")
 	thanosImage := env("KUBEGENX_THANOS_IMAGE", "quay.io/thanos/thanos:v0.42.4")
 
 	st, err := store.Open(state)
@@ -74,7 +75,7 @@ func main() {
 	selfTest(data)
 	a := &app.App{
 		NS: ns, Data: data, Scratch: scratch, Store: st, Kube: kube, Dyn: dyn,
-		WorkerImage: workerImage, ThanosImage: thanosImage, Hub: app.NewHub(),
+		WorkerImage: workerImage, ConverterImage: converterImage, ThanosImage: thanosImage, Hub: app.NewHub(),
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

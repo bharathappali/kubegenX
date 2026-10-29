@@ -27,10 +27,12 @@ if [[ -z "$RUN_UID" || -z "$FS_GID" ]]; then
   exit 1
 fi
 
-BUCKET="$(oc get pv s3-volume-pv -o jsonpath='{.spec.csi.volumeAttributes.bucketName}')"
+BUCKET="${BUCKET:-}"
 if [[ -z "$BUCKET" ]]; then
-  echo "s3-volume-pv bucketName missing" >&2
-  exit 1
+  BUCKET="$(oc get pv s3-volume-pv -o jsonpath='{.spec.csi.volumeAttributes.bucketName}' 2>/dev/null || true)"
+fi
+if [[ -z "$BUCKET" ]]; then
+  BUCKET="s3-bucket-6x4ft-for-rwx"
 fi
 
 if ! oc get pv kubegenx-data >/dev/null 2>&1; then
@@ -43,23 +45,23 @@ metadata:
     app.kubernetes.io/part-of: kubegenx
 spec:
   capacity:
-    storage: 750Gi
+    storage: 1500Gi
   accessModes: ["ReadWriteMany"]
   persistentVolumeReclaimPolicy: Retain
   storageClassName: ""
   mountOptions:
     - allow-delete
     - region us-east-2
-    - prefix kubegenx/
+    - prefix kubegenx2/
     - allow-other
     - file-mode 0666
     - dir-mode 0777
   csi:
     driver: s3.csi.aws.com
-    volumeHandle: kubegenx-data-6x4ft
+    volumeHandle: kubegenx-data-6x4ft-2
     volumeAttributes:
       bucketName: ${BUCKET}
-      prefix: kubegenx/
+      prefix: kubegenx2/
 EOF
 fi
 
@@ -77,7 +79,7 @@ spec:
   volumeName: kubegenx-data
   resources:
     requests:
-      storage: 750Gi
+      storage: 1500Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

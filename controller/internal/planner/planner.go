@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/bharathappali/kubegenx/internal/generate"
@@ -161,7 +162,8 @@ func Build(dataset string, tpl spec.Template, epoch string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	nsN, wlPer, err := dimensions(tpl)
+	names := countryPlaceNames(geo)
+	counts, err := dimensions(tpl, len(names))
 	if err != nil {
 		return nil, err
 	}
@@ -176,10 +178,10 @@ func Build(dataset string, tpl spec.Template, epoch string) (*Plan, error) {
 		ClusterName:  "kgx-" + dataset,
 		Kruize:       true,
 	}
-	if err := p.assignNamespaces(geo, nsN, tpl); err != nil {
+	if err := p.assignNamespaces(names, counts, tpl); err != nil {
 		return nil, err
 	}
-	if err := p.assignWorkloads(geo, wlPer, tpl); err != nil {
+	if err := p.assignWorkloads(names, counts, tpl); err != nil {
 		return nil, err
 	}
 	p.assignNodes(tpl)
@@ -207,59 +209,50 @@ func (p *Plan) checkExperimentNames() error {
 		ns[n.ID] = n.Name
 	}
 	for _, w := range p.Workloads {
-		kind := strings.ToLower(w.Kind)
-		name := fmt.Sprintf("%s|%s|%s|%s", p.Dataset, ns[w.NamespaceID], kind, w.Name)
-		if _, ok := seen[name]; ok {
-			return fmt.Errorf("Failed(DuplicateWorkloadName): %s", name)
+		key := ns[w.NamespaceID] + "|" + w.Name
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("Failed(DuplicateWorkloadName): %s", key)
 		}
-		if len(name) > 255 {
-			return fmt.Errorf("experiment name longer than 255: %s", name)
+		seen[key] = struct{}{}
+		exp := ExperimentName(p.Dataset, ns[w.NamespaceID], w.Kind, w.Name)
+		if len(exp) > 255 {
+			return fmt.Errorf("experiment name longer than 255: %s", exp)
 		}
-		seen[name] = struct{}{}
 	}
 	return nil
 }
 
-func (p *Plan) assignNamespaces(geo []country, n int, tpl spec.Template) error {
-	order := shuffle(tpl.Seed, len(geo), 1)
-	// Prefer countries that can hold the workloads, stable by city-count among the shuffle.
-	sort.SliceStable(order, func(i, j int) bool {
-		return len(geo[order[i]].cities) > len(geo[order[j]].cities)
-	})
-	used := map[string]int{}
-	for len(p.Namespaces) < n {
-		if len(order) == 0 {
-			return fmt.Errorf("not enough countries")
+func (p *Plan) assignNamespaces(names []string, counts []int, tpl spec.Template) error {
+	picked, err := pickNames(tpl.Seed, 15, 0, names, len(counts))
+	if err != nil {
+		return err
+	}
+	orgs, clusters := assignTenancy(tpl.Seed, counts)
+	keys := tpl.WorkloadLabels.Keys
+	if len(keys) == 0 {
+		keys = spec.DefaultTemplate().WorkloadLabels.Keys
+	}
+	var extra []spec.LabelKey
+	keyNames := []string{"org_id", "cluster_id"}
+	for _, k := range keys {
+		if k.Key == "org_id" || k.Key == "cluster_id" || k.Key == "" {
+			continue
 		}
-		c := geo[order[0]]
-		order = order[1:]
-		base := dns(c.continent + "-" + c.name)
-		used[base]++
-		name := base
-		if used[base] > 1 {
-			name = fmt.Sprintf("%s-%d", base, used[base])
-		}
-		labels := map[string]string{}
-		keys := tpl.WorkloadLabels.Keys
-		if len(keys) == 0 {
-			keys = spec.DefaultTemplate().WorkloadLabels.Keys
-		}
-		var keyNames []string
-		for _, k := range keys {
+		extra = append(extra, k)
+		keyNames = append(keyNames, k.Key)
+	}
+	p.LabelKeys = keyNames
+	for i, name := range picked {
+		labels := map[string]string{"org_id": orgs[i], "cluster_id": clusters[i]}
+		for _, k := range extra {
 			labels[k.Key] = weightedValue(tpl.Seed, uint32(len(p.Namespaces)), k)
-			keyNames = append(keyNames, k.Key)
 		}
-		p.LabelKeys = keyNames
 		p.Namespaces = append(p.Namespaces, Namespace{ID: len(p.Namespaces), Name: name, Labels: labels})
 	}
 	return nil
 }
 
-func (p *Plan) assignWorkloads(geo []country, per int, tpl spec.Template) error {
-	byName := map[string]country{}
-	for _, c := range geo {
-		byName[dns(c.continent+"-"+c.name)] = c
-	}
+func (p *Plan) assignWorkloads(names []string, counts []int, tpl spec.Template) error {
 	depShare := 80
 	if tpl.Topology.Kinds != nil {
 		if v, ok := tpl.Topology.Kinds["Deployment"]; ok {
@@ -274,49 +267,39 @@ func (p *Plan) assignWorkloads(geo []country, per int, tpl spec.Template) error 
 	if len(stsBuckets) == 0 {
 		stsBuckets = spec.DefaultTemplate().Topology.Replicas.StatefulSetBuckets
 	}
-	gpuN := gpuCount(len(p.Namespaces)*per, tpl.GPU)
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	gpuN := gpuCount(total, tpl.GPU)
 	gpuSet := map[int]bool{}
 	if gpuN > 0 {
-		perm := shuffle(tpl.Seed, len(p.Namespaces)*per, 21)
+		perm := shuffle(tpl.Seed, total, 21)
 		for i := 0; i < gpuN; i++ {
 			gpuSet[perm[i]] = true
 		}
 	}
 	wlID := 0
 	for _, ns := range p.Namespaces {
-		base := ns.Name
-		if i := strings.LastIndex(base, "-"); i > 0 {
-			if _, err := strconv.Atoi(base[i+1:]); err == nil && usedGeneration(base) {
-				base = base[:i]
-			}
+		per := 0
+		if ns.ID >= 0 && ns.ID < len(counts) {
+			per = counts[ns.ID]
 		}
-		c, ok := byName[base]
-		if !ok {
-			// generation suffix stripped incorrectly; fall back to any country
-			c = geo[ns.ID%len(geo)]
+		if per < 1 {
+			continue
 		}
-		perm := shuffle(tpl.Seed, max(per, len(c.cities)), uint32(1000+ns.ID))
-		seen := map[string]int{}
-		for j := 0; j < per; j++ {
+		picked, err := pickNames(tpl.Seed, 16, uint32(ns.ID), names, per)
+		if err != nil {
+			return err
+		}
+		for _, name := range picked {
 			kind := "Deployment"
 			if int(philox.U32(tpl.Seed, 12, uint32(wlID), 0, 0, 0)%100) >= depShare {
 				kind = "StatefulSet"
 			}
-			roles := statelessRoles
 			bks := buckets
 			if kind == "StatefulSet" {
-				roles = statefulRoles
 				bks = stsBuckets
-			}
-			city := c.cities[perm[j%len(perm)]%len(c.cities)]
-			role := roles[(perm[j%len(perm)]/max(1, len(c.cities)))%len(roles)]
-			name := dns(city + "-" + role)
-			if len(name) > 46 {
-				name = trimDNS(name, 46)
-			}
-			seen[name]++
-			if seen[name] > 1 {
-				name = trimDNS(fmt.Sprintf("%s-%s", name, base36(uint32(seen[name]))), 46)
 			}
 			reps := pickReplicas(tpl.Seed, uint32(wlID), bks)
 			rs := encodeN(philox.U32(tpl.Seed, 13, uint32(wlID), 0, 0, 1), 10)
@@ -327,15 +310,6 @@ func (p *Plan) assignWorkloads(geo []country, per int, tpl spec.Template) error 
 		}
 	}
 	return nil
-}
-
-func usedGeneration(name string) bool {
-	i := strings.LastIndex(name, "-")
-	if i < 0 {
-		return false
-	}
-	_, err := strconv.Atoi(name[i+1:])
-	return err == nil && len(name[i+1:]) <= 3
 }
 
 func (p *Plan) assignNodes(tpl spec.Template) {
@@ -748,38 +722,237 @@ func weightedValue(seed uint64, ns uint32, k spec.LabelKey) string {
 	return k.Values[0].Value
 }
 
-func dimensions(tpl spec.Template) (ns, per int, err error) {
+func dimensions(tpl spec.Template, maxNS int) ([]int, error) {
 	mode := tpl.Topology.Mode
 	if mode == "" {
 		mode = "NamespaceMatrix"
 	}
 	switch mode {
 	case "NamespaceMatrix":
-		ns = tpl.Topology.Namespaces.Count
-		per = tpl.Topology.WorkloadsPerNamespace
+		ns := tpl.Topology.Namespaces.Count
+		per := tpl.Topology.WorkloadsPerNamespace
 		if ns < 1 || per < 1 {
-			return 0, 0, fmt.Errorf("namespace matrix needs namespaces and workloadsPerNamespace")
+			return nil, fmt.Errorf("namespace matrix needs namespaces and workloadsPerNamespace")
 		}
+		if maxNS > 0 && (ns > maxNS || per > maxNS) {
+			return nil, fmt.Errorf("not enough country-place names")
+		}
+		counts := make([]int, ns)
+		for i := range counts {
+			counts[i] = per
+		}
+		return counts, nil
 	case "TotalWorkloads":
 		total := tpl.Topology.TotalWorkloads
 		if total < 1 {
-			return 0, 0, fmt.Errorf("totalWorkloads required")
+			return nil, fmt.Errorf("totalWorkloads required")
 		}
-		ns = tpl.Topology.Namespaces.Count
+		ns := tpl.Topology.Namespaces.Count
 		if ns < 1 {
-			ns = int(math.Ceil(math.Sqrt(float64(total))))
-			if ns > 2000 {
-				ns = 2000
+			ns = namespaceCount(total)
+		}
+		if ns > total {
+			ns = total
+		}
+		if maxNS > 0 && ns > maxNS {
+			ns = maxNS
+		}
+		if maxNS > 0 && total > ns*maxNS {
+			return nil, fmt.Errorf("not enough country-place names")
+		}
+		if strings.EqualFold(tpl.Topology.Namespaces.Distribution, "Zipf") {
+			s := tpl.Topology.Namespaces.ZipfS
+			if s <= 0 {
+				s = 1
 			}
-			if ns < 1 {
-				ns = 1
+			return skewedCounts(ns, total, tpl.Seed, s), nil
+		}
+		return evenCounts(ns, total), nil
+	default:
+		return nil, fmt.Errorf("unsupported topology mode %s", mode)
+	}
+}
+
+func namespaceCount(total int) int {
+	if total < 2 {
+		return 1
+	}
+	n := int(math.Round(math.Sqrt(float64(total))))
+	if n < 2 {
+		n = 2
+	}
+	if n > total {
+		n = total
+	}
+	return n
+}
+
+var (
+	namesOnce  sync.Once
+	namesCache []string
+)
+
+func countryPlaceNames(geo []country) []string {
+	namesOnce.Do(func() {
+		namesCache = buildCountryPlaceNames(geo)
+	})
+	return namesCache
+}
+
+func buildCountryPlaceNames(geo []country) []string {
+	seenC := map[string]struct{}{}
+	seenP := map[string]struct{}{}
+	var countries, places []string
+	for _, c := range geo {
+		if c.name == "" {
+			continue
+		}
+		if _, ok := seenC[c.name]; !ok {
+			seenC[c.name] = struct{}{}
+			countries = append(countries, c.name)
+		}
+		for _, city := range c.cities {
+			if city == "" {
+				continue
+			}
+			if _, ok := seenP[city]; ok {
+				continue
+			}
+			seenP[city] = struct{}{}
+			places = append(places, city)
+		}
+	}
+	sort.Strings(countries)
+	sort.Strings(places)
+	out := make([]string, 0, len(countries)*len(places))
+	seen := map[string]struct{}{}
+	for _, c := range countries {
+		for _, p := range places {
+			name := c + "-" + p
+			if len(name) > 46 {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func pickNames(seed uint64, feature, entity uint32, pool []string, n int) ([]string, error) {
+	if n < 0 || n > len(pool) {
+		return nil, fmt.Errorf("not enough country-place names")
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	swap := make(map[int]int, n*2)
+	cur := func(i int) int {
+		if v, ok := swap[i]; ok {
+			return v
+		}
+		return i
+	}
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		span := len(pool) - i
+		j := i
+		if span > 1 {
+			j += int(philox.U32(seed, feature, entity, uint32(i), 0, 1) % uint32(span))
+		}
+		vi, vj := cur(i), cur(j)
+		swap[i], swap[j] = vj, vi
+		out[i] = pool[vj]
+	}
+	return out, nil
+}
+
+func evenCounts(n, total int) []int {
+	counts := make([]int, n)
+	base, rem := total/n, total%n
+	for i := range counts {
+		counts[i] = base
+		if i < rem {
+			counts[i]++
+		}
+	}
+	return counts
+}
+
+func skewedCounts(n, total int, seed uint64, zipfS float64) []int {
+	weights := make([]float64, n)
+	var sum float64
+	for i := 0; i < n; i++ {
+		weights[i] = math.Pow(float64(i+1), -zipfS)
+		sum += weights[i]
+	}
+	type part struct {
+		i    int
+		frac float64
+		base int
+	}
+	parts := make([]part, n)
+	used := 0
+	for i := 0; i < n; i++ {
+		exact := float64(total) * weights[i] / sum
+		base := int(math.Floor(exact))
+		parts[i] = part{i: i, frac: exact - float64(base), base: base}
+		used += base
+	}
+	if total >= n {
+		for i := range parts {
+			if parts[i].base == 0 {
+				parts[i].base = 1
+				used++
 			}
 		}
-		per = (total + ns - 1) / ns
-	default:
-		return 0, 0, fmt.Errorf("unsupported topology mode %s", mode)
 	}
-	return ns, per, nil
+	left := total - used
+	if left > 0 {
+		order := append([]part(nil), parts...)
+		sort.SliceStable(order, func(a, b int) bool { return order[a].frac > order[b].frac })
+		for left > 0 {
+			for _, p := range order {
+				if left == 0 {
+					break
+				}
+				parts[p.i].base++
+				left--
+			}
+		}
+	} else {
+		for left < 0 {
+			order := append([]part(nil), parts...)
+			sort.SliceStable(order, func(a, b int) bool { return order[a].base > order[b].base })
+			moved := false
+			for _, p := range order {
+				if left == 0 {
+					break
+				}
+				if parts[p.i].base > 1 {
+					parts[p.i].base--
+					left++
+					moved = true
+				}
+			}
+			if !moved {
+				break
+			}
+		}
+	}
+	raw := make([]int, n)
+	for _, p := range parts {
+		raw[p.i] = p.base
+	}
+	perm := shuffle(seed, n, 77)
+	out := make([]int, n)
+	for i, src := range perm {
+		out[i] = raw[src]
+	}
+	return out
 }
 
 func validate(tpl spec.Template) error {
@@ -890,25 +1063,6 @@ func encodeN(v uint32, n int) string {
 		v /= uint32(len(podAlphabet))
 	}
 	return string(out)
-}
-
-func base36(v uint32) string {
-	const alpha = "0123456789abcdefghijklmnopqrstuvwxyz"
-	if v == 0 {
-		return "0"
-	}
-	var b [8]byte
-	i := len(b)
-	for v > 0 && i > 0 {
-		i--
-		b[i] = alpha[v%36]
-		v /= 36
-	}
-	s := string(b[i:])
-	if len(s) > 3 {
-		return s[len(s)-3:]
-	}
-	return s
 }
 
 func nodeName(id int, zone string) string {

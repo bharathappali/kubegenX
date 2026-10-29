@@ -48,6 +48,15 @@ func TestPlanSmallDeterministic(t *testing.T) {
 	if len(a.Namespaces) != 3 {
 		t.Fatalf("ns %d", len(a.Namespaces))
 	}
+	byNS := map[int]int{}
+	for _, w := range a.Workloads {
+		byNS[w.NamespaceID]++
+	}
+	for id, c := range byNS {
+		if c != 5 {
+			t.Fatalf("namespace %d has %d workloads, want 5 each: %+v", id, c, byNS)
+		}
+	}
 	if a.Chunks != 4 || a.Steps != 5760 || a.ChunkSamples != 1440 {
 		t.Fatalf("time chunks=%d steps=%d cs=%d", a.Chunks, a.Steps, a.ChunkSamples)
 	}
@@ -87,6 +96,145 @@ func TestPlanSmallDeterministic(t *testing.T) {
 	}
 }
 
+func TestPlanHundredThousand(t *testing.T) {
+	tpl := spec.DefaultTemplate()
+	tpl.Topology.Mode = "TotalWorkloads"
+	tpl.Topology.TotalWorkloads = 100000
+	tpl.Topology.Namespaces.Count = 0
+	tpl.Topology.Namespaces.Distribution = "Zipf"
+	tpl.Topology.Namespaces.ZipfS = 1
+	tpl.GPU.Enabled = true
+	tpl.GPU.WorkloadRatio = 0.15
+	tpl.Time = spec.Time{Step: "15s", Duration: "15d", Chunk: "6h"}
+	p, err := Build("gifted-golick", tpl, "2026-10-05T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	geo, err := loadCountries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := map[string]struct{}{}
+	for _, name := range countryPlaceNames(geo) {
+		pool[name] = struct{}{}
+	}
+	if len(p.Workloads) != 100000 {
+		t.Fatalf("workloads %d", len(p.Workloads))
+	}
+	if len(p.Namespaces) != 316 {
+		t.Fatalf("namespaces %d", len(p.Namespaces))
+	}
+	seenNS := map[string]struct{}{}
+	byNS := map[int]map[string]struct{}{}
+	for _, ns := range p.Namespaces {
+		if _, ok := pool[ns.Name]; !ok || len(ns.Name) > 46 {
+			t.Fatalf("namespace %s", ns.Name)
+		}
+		if _, ok := seenNS[ns.Name]; ok {
+			t.Fatalf("duplicate namespace %s", ns.Name)
+		}
+		seenNS[ns.Name] = struct{}{}
+	}
+	for _, w := range p.Workloads {
+		if _, ok := pool[w.Name]; !ok || len(w.Name) > 46 {
+			t.Fatalf("workload %s", w.Name)
+		}
+		if byNS[w.NamespaceID] == nil {
+			byNS[w.NamespaceID] = map[string]struct{}{}
+		}
+		if _, ok := byNS[w.NamespaceID][w.Name]; ok {
+			t.Fatalf("duplicate workload %s in namespace %d", w.Name, w.NamespaceID)
+		}
+		byNS[w.NamespaceID][w.Name] = struct{}{}
+	}
+	est := int64(len(p.Containers)) * int64(p.Steps) * 16
+	reserved := est + est/3
+	t.Logf("namespaces=%d workloads=%d pods=%d containers=%d gpus=%d steps=%d chunks=%d items=%d est=%d reserved=%d",
+		len(p.Namespaces), len(p.Workloads), len(p.Pods), len(p.Containers), len(p.GPUs), p.Steps, p.Chunks, len(p.Items), est, reserved)
+	if reserved > 1500*1024*1024*1024 {
+		t.Fatalf("reserved %d exceeds 1500Gi", reserved)
+	}
+}
+
+func TestNamespacesCapAtCountries(t *testing.T) {
+	geo, err := loadCountries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tpl := spec.DefaultTemplate()
+	tpl.Topology.Mode = "TotalWorkloads"
+	tpl.Topology.TotalWorkloads = len(geo) + 2
+	tpl.Topology.Namespaces.Count = len(geo) + 2
+	tpl.Topology.Namespaces.Distribution = "Uniform"
+	tpl.Time = spec.Time{Step: "15s", Duration: "6h", Chunk: "6h"}
+	tpl.GPU.Enabled = false
+	p, err := Build("wide", tpl, "2026-10-05T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNS := len(geo) + 2
+	if len(p.Namespaces) != wantNS {
+		t.Fatalf("namespaces %d", len(p.Namespaces))
+	}
+	if len(p.Workloads) != wantNS {
+		t.Fatalf("workloads %d", len(p.Workloads))
+	}
+	pool := map[string]struct{}{}
+	for _, name := range countryPlaceNames(geo) {
+		pool[name] = struct{}{}
+	}
+	for _, ns := range p.Namespaces {
+		if _, ok := pool[ns.Name]; !ok {
+			t.Fatalf("namespace %s", ns.Name)
+		}
+	}
+	for _, w := range p.Workloads {
+		if _, ok := pool[w.Name]; !ok {
+			t.Fatalf("workload %s", w.Name)
+		}
+	}
+}
+
+func TestTotalWorkloadsSkewed(t *testing.T) {
+	tpl := spec.DefaultTemplate()
+	tpl.Topology.Mode = "TotalWorkloads"
+	tpl.Topology.TotalWorkloads = 15
+	tpl.Topology.Namespaces.Count = 0
+	tpl.Topology.Namespaces.Distribution = "Zipf"
+	tpl.Topology.Namespaces.ZipfS = 1
+	tpl.Time = spec.Time{Step: "15s", Duration: "6h", Chunk: "6h"}
+	p, err := Build("skew", tpl, "2026-10-05T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Workloads) != 15 {
+		t.Fatalf("workloads %d", len(p.Workloads))
+	}
+	counts := map[int]int{}
+	for _, w := range p.Workloads {
+		counts[w.NamespaceID]++
+	}
+	if len(counts) < 2 {
+		t.Fatalf("namespaces %+v", counts)
+	}
+	min, max, sum := 100, 0, 0
+	for _, c := range counts {
+		if c < min {
+			min = c
+		}
+		if c > max {
+			max = c
+		}
+		sum += c
+	}
+	if sum != 15 {
+		t.Fatalf("sum %d %+v", sum, counts)
+	}
+	if max-min < 2 {
+		t.Fatalf("distribution too even %+v", counts)
+	}
+}
+
 func TestBucketMean(t *testing.T) {
 	buckets := spec.DefaultTemplate().Topology.Replicas.Buckets
 	var sum int
@@ -101,8 +249,15 @@ func TestBucketMean(t *testing.T) {
 }
 
 func TestDuplicateFailsClosed(t *testing.T) {
-	p := &Plan{Dataset: "d", Namespaces: []Namespace{{ID: 0, Name: "ns"}},
-		Workloads: []Workload{{ID: 0, NamespaceID: 0, Kind: "Deployment", Name: "a"}, {ID: 1, NamespaceID: 0, Kind: "Deployment", Name: "a"}}}
+	p := &Plan{Dataset: "d", Namespaces: []Namespace{{ID: 0, Name: "ns"}, {ID: 1, Name: "other"}},
+		Workloads: []Workload{
+			{ID: 0, NamespaceID: 0, Kind: "Deployment", Name: "a"},
+			{ID: 1, NamespaceID: 1, Kind: "Deployment", Name: "a"},
+		}}
+	if err := p.checkExperimentNames(); err != nil {
+		t.Fatal(err)
+	}
+	p.Workloads = append(p.Workloads, Workload{ID: 2, NamespaceID: 0, Kind: "StatefulSet", Name: "a"})
 	if err := p.checkExperimentNames(); err == nil || !strings.Contains(err.Error(), "DuplicateWorkloadName") {
 		t.Fatal(err)
 	}

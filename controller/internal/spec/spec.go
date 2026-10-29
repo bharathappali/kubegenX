@@ -133,8 +133,12 @@ type KruizeExport struct {
 type Export struct {
 	Type           string            `json:"type" yaml:"type"`
 	Dataset        string            `json:"dataset" yaml:"dataset"`
+	Effort         string            `json:"effort" yaml:"effort"`
+	Anchor         string            `json:"anchor" yaml:"anchor"`
 	StartTime      string            `json:"startTime" yaml:"startTime"`
 	EndTime        string            `json:"endTime" yaml:"endTime"`
+	Interval       string            `json:"interval" yaml:"interval"`
+	SessionID      string            `json:"sessionId" yaml:"sessionId"`
 	BlockDuration  string            `json:"blockDuration" yaml:"blockDuration"`
 	ExternalLabels map[string]string `json:"externalLabels" yaml:"externalLabels"`
 	ScratchMode    string            `json:"scratchMode" yaml:"scratchMode"`
@@ -214,8 +218,8 @@ func DefaultTemplate() Template {
 		WorkloadLabels: WorkloadLabels{
 			Scope: "namespace",
 			Keys: []LabelKey{
-				{Key: "org_id", Values: []LabelValue{{Value: "acme-retail", Weight: 3}, {Value: "globex", Weight: 1}}},
-				{Key: "cluster_id", Values: []LabelValue{{Value: "ocp-east-1", Weight: 2}, {Value: "ocp-west-2", Weight: 1}}},
+				{Key: "org_id"},
+				{Key: "cluster_id"},
 			},
 			CarryOn: []string{"namespace", "ksm-pod", "ksm-container", "recorded", "cadvisor"},
 		},

@@ -2,7 +2,6 @@ package app
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bharathappali/kubegenx/internal/kruize"
+	"github.com/bharathappali/kubegenx/internal/aggregate"
 	"github.com/bharathappali/kubegenx/internal/planner"
 	"github.com/bharathappali/kubegenx/internal/spec"
 	"github.com/bharathappali/kubegenx/internal/store"
@@ -32,7 +31,10 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/datasets", a.createDataset)
 	mux.HandleFunc("GET /api/v1/datasets/{ds}", a.getDataset)
 	mux.HandleFunc("GET /api/v1/datasets/{ds}/progress", a.getDataset)
+	mux.HandleFunc("GET /api/v1/datasets/{ds}/layout", a.getLayout)
+	mux.HandleFunc("GET /api/v1/datasets/{ds}/workloads", a.getWorkloads)
 	mux.HandleFunc("GET /api/v1/datasets/{ds}/labels", a.getLabels)
+	mux.HandleFunc("GET /api/v1/datasets/{ds}/orgs", a.getOrgs)
 	mux.HandleFunc("GET /api/v1/datasets/{ds}/verify", a.getVerify)
 	mux.HandleFunc("DELETE /api/v1/datasets/{ds}", a.deleteDataset)
 	mux.HandleFunc("DELETE /api/v1/datasets/{ds}/parquet", a.deleteParquet)
@@ -40,13 +42,16 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/exports", a.createExport)
 	mux.HandleFunc("GET /api/v1/exports/{name}", a.getExport)
 	mux.HandleFunc("DELETE /api/v1/exports/{name}", a.deleteExport)
+	mux.HandleFunc("POST /api/v1/exports/{name}/serve", a.serveExport)
+	mux.HandleFunc("GET /api/v1/exports/{name}/blocks", a.listBlocks)
+	mux.HandleFunc("POST /api/v1/exports/{name}/blocks/lease", a.leaseBlocks)
+	mux.HandleFunc("POST /api/v1/exports/{name}/blocks/heartbeat", a.heartbeatBlocks)
+	mux.HandleFunc("POST /api/v1/exports/{name}/blocks/{id}/complete", a.completeBlock)
+	mux.HandleFunc("POST /api/v1/exports/{name}/blocks/{id}/fail", a.failBlock)
 	mux.HandleFunc("GET /api/v1/storage", a.getStorage)
-	mux.HandleFunc("POST /api/v1/datasets/{ds}/exporters/kruize/sessions", a.createSession)
-	mux.HandleFunc("GET /api/v1/datasets/{ds}/exporters/kruize/sessions", a.listSessions)
-	mux.HandleFunc("GET /api/v1/datasets/{ds}/exporters/kruize/sessions/{sid}", a.getSession)
-	mux.HandleFunc("DELETE /api/v1/datasets/{ds}/exporters/kruize/sessions/{sid}", a.deleteSession)
-	mux.HandleFunc("GET /api/v1/datasets/{ds}/exporters/kruize/sessions/{sid}/experiments", a.getExperiments)
-	mux.HandleFunc("GET /api/v1/datasets/{ds}/exporters/kruize/sessions/{sid}/experiments/{exp}/results", a.getResults)
+	mux.HandleFunc("GET /api/v1/datasets/{ds}/sessions/{id}/namespaces", a.sessionNamespaces)
+	mux.HandleFunc("GET /api/v1/datasets/{ds}/sessions/{id}/namespaces/{ns}/workloads", a.sessionWorkloads)
+	mux.HandleFunc("GET /api/v1/datasets/{ds}/sessions/{id}/results", a.sessionResults)
 	mux.HandleFunc("GET /api/v1/ws", a.ws)
 	mux.Handle("/", a.ui())
 	return mux
@@ -101,6 +106,7 @@ func (a *App) createDataset(w http.ResponseWriter, r *http.Request) {
 		Name     string       `json:"name"`
 		Template string       `json:"template"`
 		Epoch    string       `json:"epoch"`
+		Effort   string       `json:"effort"`
 		Workers  spec.Workers `json:"workers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -123,13 +129,24 @@ func (a *App) createDataset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if body.Workers.Count > 0 {
-		tpl.Workers = body.Workers
+	if body.Workers.CPU != "" {
+		tpl.Workers.CPU = body.Workers.CPU
+	}
+	if body.Workers.Memory != "" {
+		tpl.Workers.Memory = body.Workers.Memory
+	}
+	if body.Workers.Threads > 0 {
+		tpl.Workers.Threads = body.Workers.Threads
+	}
+	tpl.Workers = a.sizeWorkers(c, body.Effort, tpl.Workers)
+	epoch := body.Epoch
+	if epoch == "" {
+		epoch = defaultEpoch(time.Now(), tpl)
 	}
 	ds := spec.Dataset{
 		TemplateRef:      spec.TemplateRef{Name: body.Template},
 		TemplateSnapshot: tpl,
-		Epoch:            body.Epoch,
+		Epoch:            epoch,
 		Workers:          tpl.Workers,
 		Exporters:        spec.DatasetExports{Kruize: spec.KruizeExport{Enabled: true, ClusterName: "kgx-" + body.Name, PerformanceProfile: "resource-optimization-openshift"}},
 	}
@@ -152,11 +169,71 @@ func (a *App) listDatasets(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) getDataset(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("ds")
-	phase, _ := a.Store.Phase(name)
-	p, _ := a.Store.Progress(name)
-	doc := statusFrom(p, phase, "")
-	doc["name"] = name
-	writeJSON(w, 200, doc)
+	writeJSON(w, 200, a.progressDoc(name, ""))
+}
+
+func (a *App) getLayout(w http.ResponseWriter, r *http.Request) {
+	man, err := readManifest(a.Data, r.PathValue("ds"))
+	if err != nil {
+		writeErr(w, 404, err.Error())
+		return
+	}
+	ranges, _ := man["namespaceRanges"].([]any)
+	if ranges == nil {
+		ranges = []any{}
+	}
+	writeJSON(w, 200, map[string]any{
+		"chunks": man["chunks"], "chunkSeconds": man["chunkSeconds"], "stepSeconds": man["stepSeconds"],
+		"epoch": man["epoch"], "workloads": man["workloads"], "namespaces": ranges,
+	})
+}
+
+func (a *App) getWorkloads(w http.ResponseWriter, r *http.Request) {
+	raw, err := os.ReadFile(filepath.Join(a.Data, "datasets", r.PathValue("ds"), "plan", "workloads.json"))
+	if err != nil {
+		writeErr(w, 404, err.Error())
+		return
+	}
+	var all []map[string]any
+	if err := json.Unmarshal(raw, &all); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if offset < 0 {
+		offset = 0
+	}
+	if limit < 1 {
+		limit = 40
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset > len(all) {
+		offset = len(all)
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	items := all[offset:end]
+	if items == nil {
+		items = []map[string]any{}
+	}
+	writeJSON(w, 200, map[string]any{"total": len(all), "offset": offset, "items": items})
+}
+
+func readManifest(data, name string) (map[string]any, error) {
+	raw, err := os.ReadFile(filepath.Join(data, "datasets", name, "plan", "manifest.json"))
+	if err != nil {
+		return nil, err
+	}
+	var man map[string]any
+	if err := json.Unmarshal(raw, &man); err != nil {
+		return nil, err
+	}
+	return man, nil
 }
 
 func (a *App) getLabels(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +263,15 @@ func (a *App) getLabels(w http.ResponseWriter, r *http.Request) {
 		combos = append(combos, *counts[k])
 	}
 	writeJSON(w, 200, map[string]any{"keys": plan.LabelKeys, "combinations": combos, "totalNamespaces": len(plan.Namespaces)})
+}
+
+func (a *App) getOrgs(w http.ResponseWriter, r *http.Request) {
+	plan, err := loadPlan(a.Data, r.PathValue("ds"))
+	if err != nil {
+		writeErr(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, planner.OrgMapOf(plan))
 }
 
 func (a *App) getVerify(w http.ResponseWriter, r *http.Request) {
@@ -245,25 +331,100 @@ func (a *App) listExports(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) createExport(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name      string `json:"name"`
-		Dataset   string `json:"dataset"`
-		StartTime string `json:"startTime"`
+		Dataset  string `json:"dataset"`
+		Type     string `json:"type"`
+		Anchor   string `json:"anchor"`
+		Time     string `json:"time"`
+		Interval string `json:"interval"`
+		Effort   string `json:"effort"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if !dnsOK(body.Name) {
-		writeErr(w, 400, "invalid name")
+	if body.Type == "" {
+		body.Type = "thanos"
+	}
+	if body.Type != "thanos" && body.Type != "generic" {
+		writeErr(w, 400, "type must be thanos or generic")
 		return
 	}
-	ex := spec.Export{Type: "thanos", Dataset: body.Dataset, StartTime: body.StartTime, BlockDuration: "24h", ExternalLabels: map[string]string{"kubegenx_export": body.Name}}
-	raw, _ := yaml.Marshal(ex)
-	if err := a.putCM("export", body.Name, body.Dataset, map[string]string{"spec.yaml": string(raw)}, true); err != nil {
+	if body.Dataset == "" {
+		writeErr(w, 400, "dataset is required")
+		return
+	}
+	plan, err := loadPlan(a.Data, body.Dataset)
+	if err != nil {
+		writeErr(w, 404, err.Error())
+		return
+	}
+	start, end, err := aggregate.Window(plan, body.Anchor, body.Time)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if body.Anchor == "" {
+		body.Anchor = "start"
+	}
+	existing, err := a.Store.ListExports()
+	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 201, map[string]any{"name": body.Name})
+	name := body.Dataset
+	sessionID := ""
+	if body.Type == "thanos" {
+		for _, row := range existing {
+			if row.Dataset == body.Dataset && (row.Type == "" || row.Type == "thanos") {
+				writeErr(w, 409, "dataset already has a Thanos export")
+				return
+			}
+		}
+		if !dnsOK(name) {
+			writeErr(w, 400, "invalid name")
+			return
+		}
+	} else {
+		step := time.Duration(plan.StepSeconds) * time.Second
+		if _, err := aggregate.ParseInterval(body.Interval, step); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		name = newSessionID()
+		sessionID = name
+	}
+	if body.Effort == "" {
+		body.Effort = "xhigh"
+	}
+	ex := spec.Export{
+		Type: body.Type, Dataset: body.Dataset, Effort: body.Effort, Anchor: body.Anchor,
+		StartTime: start.Format(time.RFC3339), EndTime: end.Format(time.RFC3339),
+		Interval: body.Interval, SessionID: sessionID, BlockDuration: "2h",
+		ExternalLabels: map[string]string{"kubegenx_export": name},
+	}
+	raw, _ := yaml.Marshal(ex)
+	row := store.ExportRow{
+		Name: name, Dataset: body.Dataset, Phase: "Configured", Type: body.Type, SessionID: sessionID,
+		Anchor: body.Anchor, StartTime: ex.StartTime, EndTime: ex.EndTime, Interval: body.Interval,
+	}
+	if err := a.Store.SaveExport(row); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if err := a.putCM("export", name, body.Dataset, map[string]string{"spec.yaml": string(raw), "_type": body.Type}, true); err != nil {
+		_ = a.Store.DeleteExport(name)
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 201, map[string]any{"name": name, "sessionId": sessionID, "startTime": ex.StartTime, "endTime": ex.EndTime, "type": body.Type})
+}
+
+func newSessionID() string {
+	s := strings.ToLower(strconv.FormatInt(time.Now().UnixNano(), 36))
+	if len(s) > 12 {
+		s = s[len(s)-12:]
+	}
+	return "g" + s
 }
 
 func (a *App) getExport(w http.ResponseWriter, r *http.Request) {
@@ -304,143 +465,6 @@ func (a *App) getStorage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) createSession(w http.ResponseWriter, r *http.Request) {
-	ds := r.PathValue("ds")
-	var body struct {
-		EndTime string `json:"endTime"`
-		Name    string `json:"name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	deleted, _ := a.Store.ParquetDeleted(ds)
-	if deleted {
-		writeJSON(w, 410, map[string]any{"error": "Gone"})
-		return
-	}
-	plan, err := loadPlan(a.Data, ds)
-	if err != nil {
-		writeErr(w, 404, err.Error())
-		return
-	}
-	end, err := kruize.FloorEnd(body.EndTime, time.Now())
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	offset, originalEnd, effStart, effEnd, err := kruize.Offset(plan, end)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	id := "s-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	now := time.Now().UTC()
-	sess := store.Session{
-		ID: id, Dataset: ds, Name: body.Name, EndTime: end.Format(time.RFC3339),
-		OffsetSeconds: int64(offset.Seconds()), CreatedAt: now, ExpiresAt: now.Add(72 * time.Hour), LastAccess: now,
-	}
-	if err := a.Store.CreateSession(sess); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	pages := (len(plan.Workloads) + 99) / 100
-	writeJSON(w, 201, map[string]any{
-		"sessionId": id, "name": body.Name, "endTime": end.Format(time.RFC3339),
-		"offsetSeconds":  int64(offset.Seconds()),
-		"originalRange":  map[string]string{"start": plan.Epoch, "end": originalEnd.Format(time.RFC3339)},
-		"effectiveRange": map[string]string{"start": effStart.Format(time.RFC3339), "end": effEnd.Format(time.RFC3339)},
-		"totals": map[string]int{
-			"experiments": len(plan.Workloads), "experimentPages": pages,
-			"resultsPagesPerExperiment": plan.Chunks, "intervalsPerPage": 24,
-		},
-		"createdAt": now.Format(time.RFC3339), "expiresAt": sess.ExpiresAt.Format(time.RFC3339),
-	})
-}
-
-func (a *App) listSessions(w http.ResponseWriter, r *http.Request) {
-	items, err := a.Store.ListSessions(r.PathValue("ds"))
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	if items == nil {
-		items = []store.Session{}
-	}
-	writeJSON(w, 200, map[string]any{"items": items})
-}
-
-func (a *App) getSession(w http.ResponseWriter, r *http.Request) {
-	sess, err := a.Store.GetSession(r.PathValue("sid"))
-	if err != nil || sess.Dataset != r.PathValue("ds") {
-		writeErr(w, 404, "not found")
-		return
-	}
-	writeJSON(w, 200, sess)
-}
-
-func (a *App) deleteSession(w http.ResponseWriter, r *http.Request) {
-	if err := a.Store.CloseSession(r.PathValue("sid")); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"closed": r.PathValue("sid")})
-}
-
-func (a *App) getExperiments(w http.ResponseWriter, r *http.Request) {
-	sess, plan, ok := a.sessionPlan(w, r)
-	if !ok {
-		return
-	}
-	_ = a.Store.TouchSession(sess.ID)
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
-	data, total, pages := kruize.Experiments(plan, page, pageSize)
-	if page < 1 {
-		page = 1
-	}
-	if pageSize <= 0 {
-		pageSize = 100
-	}
-	writeJSON(w, 200, map[string]any{
-		"metadata": map[string]any{"dataset": plan.Dataset, "sessionId": sess.ID, "total": total, "page": page, "pageSize": pageSize, "totalPages": pages, "order": "wl_id"},
-		"data":     data,
-	})
-}
-
-func (a *App) getResults(w http.ResponseWriter, r *http.Request) {
-	sess, plan, ok := a.sessionPlan(w, r)
-	if !ok {
-		return
-	}
-	_ = a.Store.TouchSession(sess.ID)
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	exp := r.PathValue("exp")
-	data, err := kruize.Results(plan, filepath.Join(a.Data, "datasets", plan.Dataset), exp, page, time.Duration(sess.OffsetSeconds)*time.Second)
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{
-		"metadata": map[string]any{"dataset": plan.Dataset, "sessionId": sess.ID, "experiment": exp, "page": page, "chunk": page, "totalPages": plan.Chunks},
-		"data":     data,
-	})
-}
-
-func (a *App) sessionPlan(w http.ResponseWriter, r *http.Request) (store.Session, *planner.Plan, bool) {
-	sess, err := a.Store.GetSession(r.PathValue("sid"))
-	if err != nil || sess.Closed || sess.Dataset != r.PathValue("ds") {
-		writeErr(w, 404, "session not found")
-		return store.Session{}, nil, false
-	}
-	plan, err := loadPlan(a.Data, sess.Dataset)
-	if err != nil {
-		writeErr(w, 404, err.Error())
-		return store.Session{}, nil, false
-	}
-	return sess, plan, true
-}
-
 func (a *App) ws(w http.ResponseWriter, r *http.Request) {
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -473,7 +497,12 @@ func (a *App) putCM(kind, name, dataset string, data map[string]string, finalize
 		labels["kubegenx.io/dataset"] = dataset
 	}
 	if kind == "export" {
-		labels["kubegenx.io/export-type"] = "thanos"
+		typ := data["_type"]
+		if typ == "" {
+			typ = "thanos"
+		}
+		delete(data, "_type")
+		labels["kubegenx.io/export-type"] = typ
 	}
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cmName(kind, name), Namespace: a.NS, Labels: labels}, Data: data}
 	if finalizer {
@@ -501,6 +530,14 @@ func (a *App) listKind(kind string) ([]map[string]any, error) {
 			p, _ := a.Store.Progress(name)
 			item["phase"] = phase
 			item["progress"] = statusFrom(p, phase, "")
+			if man, err := readManifest(a.Data, name); err == nil {
+				item["namespaces"] = man["namespaces"]
+				item["workloads"] = man["workloads"]
+				item["samples"] = man["samples"]
+				item["entries"] = man["entries"]
+				item["days"] = man["days"]
+				item["stepSeconds"] = man["stepSeconds"]
+			}
 		}
 		items = append(items, item)
 	}

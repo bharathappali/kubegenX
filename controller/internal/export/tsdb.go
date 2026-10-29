@@ -41,78 +41,96 @@ type Result struct {
 	Bytes  int64
 }
 
-// Build reads dataset Parquet and writes one TSDB block on scratch, then copies it
-// onto the export directory. Scratch is required because the data volume may not
-// support rename or mmap.
-func Build(ctx context.Context, plan *planner.Plan, datasetDir, scratch, exportName string, start time.Time, external map[string]string) (Result, error) {
-	cpuRows, err := samples.ReadCPU(datasetDir)
-	if err != nil {
-		return Result{}, err
-	}
-	memRows, err := samples.ReadMem(datasetDir)
-	if err != nil {
-		return Result{}, err
-	}
-	gpuRows, err := samples.ReadGPU(datasetDir)
-	if err != nil {
-		return Result{}, err
-	}
-	if len(cpuRows) == 0 {
-		return Result{}, fmt.Errorf("no cpu samples")
-	}
-	tmp := filepath.Join(scratch, "tsdb-"+exportName)
+const blockSpan = 2 * time.Hour
+
+// Build turns Parquet into 2h TSDB blocks without loading the dataset.
+// A scan estimates each item, then goroutines fill 75% of the 16GiB pod.
+func Build(ctx context.Context, plan *planner.Plan, datasetDir, scratch, exportName string, start time.Time, external map[string]string, progress func(done, total int, bytes int64, workers int, heap, budget int64)) (Result, error) {
+	return buildBatched(ctx, plan, datasetDir, scratch, exportName, start, external, progress)
+}
+
+func writeBlock(ctx context.Context, plan *planner.Plan, cpuRows []samples.CPURow, memRows []samples.MemRow, gpuRows []samples.GPURow, scratch, exportName, token string, origin, lo, hi time.Time, destRoot string, external map[string]string, wlLo, wlHi, stepLo, stepHi int, emitNS bool) (int, int64, error) {
+	tmp := filepath.Join(scratch, "tsdb-"+exportName+"-"+token)
 	if err := os.RemoveAll(tmp); err != nil {
-		return Result{}, err
+		return 0, 0, err
 	}
 	if err := os.MkdirAll(tmp, 0o775); err != nil {
-		return Result{}, err
+		return 0, 0, err
 	}
-	blockRange := int64(24 * time.Hour / time.Millisecond)
-	w, err := tsdb.NewBlockWriter(slog.Default(), tmp, blockRange)
+	defer os.RemoveAll(tmp)
+	span := hi.Sub(lo).Milliseconds()
+	if span < 1 {
+		span = 1
+	}
+	w, err := tsdb.NewBlockWriter(slog.Default(), tmp, span)
 	if err != nil {
-		return Result{}, err
+		return 0, 0, err
 	}
 	app := w.Appender(ctx)
 	b := &builder{
-		app:     app,
-		start:   start.UnixMilli(),
-		stepSec: plan.StepSeconds,
-		plan:    plan,
+		app: app, start: origin.UnixMilli(), stepSec: plan.StepSeconds, plan: plan,
+		winLo: lo.UnixMilli(), winHi: hi.UnixMilli(),
+		wlLo: wlLo, wlHi: wlHi, stepLo: stepLo, stepHi: stepHi, emitNS: emitNS,
 	}
 	if err := b.emit(cpuRows, memRows, gpuRows); err != nil {
 		w.Close()
-		return Result{}, err
+		return 0, 0, err
+	}
+	if b.appended == 0 {
+		w.Close()
+		return 0, 0, nil
 	}
 	if err := app.Commit(); err != nil {
 		w.Close()
-		return Result{}, err
+		return 0, 0, err
 	}
 	id, err := w.Flush(ctx)
 	w.Close()
 	if err != nil {
-		return Result{}, err
+		return 0, 0, err
 	}
 	blockDir := filepath.Join(tmp, id.String())
 	if err := addThanosMeta(blockDir, plan, exportName, external); err != nil {
-		return Result{}, err
+		return 0, 0, err
 	}
-	dest := filepath.Join(filepath.Dir(datasetDir), "..", "exports", plan.Dataset, exportName, "tsdb", id.String())
-	// datasetDir is /data/datasets/<ds>. Export lives at /data/exports/<ds>/<ex>/tsdb.
-	dest = filepath.Join(filepath.Dir(filepath.Dir(datasetDir)), "exports", plan.Dataset, exportName, "tsdb", id.String())
-	if err := copyTree(blockDir, dest); err != nil {
-		return Result{}, err
+	dst := filepath.Join(destRoot, id.String())
+	if err := copyTree(blockDir, dst); err != nil {
+		return 0, 0, err
 	}
-	_ = os.RemoveAll(tmp)
-	bytes, _ := dirSize(dest)
-	return Result{Blocks: 1, Bytes: bytes}, nil
+	dropCache(blockDir)
+	dropCache(dst)
+	sz, _ := dirSize(dst)
+	return 1, sz, nil
 }
 
 type builder struct {
-	app     storage.Appender
-	start   int64
-	stepSec int
-	plan    *planner.Plan
-	err     error
+	app      storage.Appender
+	start    int64
+	stepSec  int
+	plan     *planner.Plan
+	winLo    int64
+	winHi    int64
+	wlLo     int
+	wlHi     int
+	stepLo   int
+	stepHi   int
+	emitNS   bool
+	appended int
+	err      error
+}
+
+func (b *builder) inShard(workloadID int) bool {
+	if b.wlHi <= b.wlLo {
+		return true
+	}
+	return workloadID >= b.wlLo && workloadID < b.wlHi
+}
+
+func (b *builder) accept(ts int64) bool {
+	if b.winHi <= b.winLo {
+		return true
+	}
+	return ts >= b.winLo && ts < b.winHi
 }
 
 func (b *builder) emit(cpuRows []samples.CPURow, memRows []samples.MemRow, gpuRows []samples.GPURow) error {
@@ -137,6 +155,9 @@ func (b *builder) emit(cpuRows []samples.CPURow, memRows []samples.MemRow, gpuRo
 		memBy[[3]uint32{r.CtrID, uint32(r.LifeSeq), r.StepIdx}] = r
 	}
 	for _, c := range b.plan.Containers {
+		if !b.inShard(c.WorkloadID) {
+			continue
+		}
 		p := pod[c.PodID]
 		w := wl[c.WorkloadID]
 		n := ns[w.NamespaceID]
@@ -199,7 +220,7 @@ func (b *builder) series(name string, base map[string]string, rows []samples.CPU
 	var prev int64 = -1
 	for _, r := range rows {
 		ts := b.start + int64(r.StepIdx)*int64(b.stepSec)*1000
-		if ts <= prev {
+		if ts <= prev || !b.accept(ts) {
 			continue
 		}
 		prev = ts
@@ -207,6 +228,7 @@ func (b *builder) series(name string, base map[string]string, rows []samples.CPU
 			b.err = fmt.Errorf("%s: %w", name, err)
 			return
 		}
+		b.appended++
 	}
 }
 
@@ -220,6 +242,9 @@ func (b *builder) rates(base map[string]string, rows []samples.CPURow) {
 	rate := withName(recRate, map[string]string{"namespace": base["namespace"], "pod": base["pod"], "container": base["container"], "node": base["node"], "org_id": base["org_id"], "cluster_id": base["cluster_id"]})
 	for i := 1; i < len(rows); i++ {
 		ts := b.start + int64(rows[i].StepIdx)*int64(b.stepSec)*1000
+		if !b.accept(ts) {
+			continue
+		}
 		du := float64(rows[i].UsageUs-rows[i-1].UsageUs) / 1e6
 		dt := float64(rows[i].StepIdx-rows[i-1].StepIdx) * float64(b.stepSec)
 		if dt <= 0 {
@@ -247,6 +272,7 @@ func (b *builder) rates(base map[string]string, rows []samples.CPURow) {
 			b.err = err
 			return
 		}
+		b.appended += 3
 	}
 }
 
@@ -293,17 +319,18 @@ func (b *builder) ksmContainer(n planner.Namespace, p planner.Pod, w planner.Wor
 }
 
 func (b *builder) staticSteps(name string, base map[string]string, rows []samples.CPURow, v float64) {
-	if b.err != nil {
+	if b.err != nil || len(rows) == 0 {
 		return
 	}
 	lbls := withName(name, base)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].StepIdx < rows[j].StepIdx })
 	var prev int64 = -1
 	for _, r := range rows {
 		if r.StepIdx%2 != 0 {
 			continue
 		}
 		ts := b.start + int64(r.StepIdx)*int64(b.stepSec)*1000
-		if ts <= prev {
+		if ts <= prev || !b.accept(ts) {
 			continue
 		}
 		prev = ts
@@ -311,19 +338,25 @@ func (b *builder) staticSteps(name string, base map[string]string, rows []sample
 			b.err = err
 			return
 		}
+		b.appended++
 	}
 }
 
 func (b *builder) ksmPods(ns map[int]planner.Namespace, wl map[int]planner.Workload, pods map[int]planner.Pod) {
 	steps := b.plan.Steps
-	for _, n := range b.plan.Namespaces {
-		lbl := map[string]string{"namespace": n.Name, "phase": "Active"}
-		for k, v := range n.Labels {
-			lbl[k] = v
+	if b.emitNS || b.wlHi <= b.wlLo {
+		for _, n := range b.plan.Namespaces {
+			lbl := map[string]string{"namespace": n.Name, "phase": "Active"}
+			for k, v := range n.Labels {
+				lbl[k] = v
+			}
+			b.staticRange("kube_namespace_status_phase", lbl, steps, 1)
 		}
-		b.staticRange("kube_namespace_status_phase", lbl, steps, 1)
 	}
 	for _, p := range pods {
+		if !b.inShard(p.WorkloadID) {
+			continue
+		}
 		w := wl[p.WorkloadID]
 		n := ns[w.NamespaceID]
 		info := map[string]string{
@@ -357,7 +390,7 @@ func (b *builder) ksmPods(ns map[int]planner.Namespace, wl map[int]planner.Workl
 	}
 	seenRS := map[string]bool{}
 	for _, w := range b.plan.Workloads {
-		if w.Kind != "Deployment" {
+		if !b.inShard(w.ID) || w.Kind != "Deployment" {
 			continue
 		}
 		n := ns[w.NamespaceID]
@@ -382,12 +415,29 @@ func (b *builder) staticRange(name string, base map[string]string, steps int, v 
 		return
 	}
 	lbls := withName(name, base)
-	for step := 0; step < steps; step += 2 {
+	lo, hi := 0, steps
+	if b.stepHi > b.stepLo {
+		lo, hi = b.stepLo, b.stepHi
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > steps {
+			hi = steps
+		}
+	}
+	if lo%2 != 0 {
+		lo++
+	}
+	for step := lo; step < hi; step += 2 {
 		ts := b.start + int64(step)*int64(b.stepSec)*1000
+		if !b.accept(ts) {
+			continue
+		}
 		if _, err := b.app.Append(0, lbls, ts, v); err != nil {
 			b.err = err
 			return
 		}
+		b.appended++
 	}
 }
 
@@ -401,6 +451,9 @@ func (b *builder) gpus(ns map[int]planner.Namespace, wl map[int]planner.Workload
 		ctr[c.ID] = c
 	}
 	for _, g := range b.plan.GPUs {
+		if !b.inShard(g.WorkloadID) {
+			continue
+		}
 		c := ctr[g.ContainerID]
 		p := pods[g.PodID]
 		w := wl[g.WorkloadID]
@@ -435,7 +488,7 @@ func (b *builder) gpuSeries(name string, base map[string]string, rows []samples.
 	var prev int64 = -1
 	for _, r := range rows {
 		ts := b.start + int64(r.StepIdx)*int64(b.stepSec)*1000
-		if ts <= prev {
+		if ts <= prev || !b.accept(ts) {
 			continue
 		}
 		prev = ts
@@ -443,6 +496,7 @@ func (b *builder) gpuSeries(name string, base map[string]string, rows []samples.
 			b.err = err
 			return
 		}
+		b.appended++
 	}
 }
 

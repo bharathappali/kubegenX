@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-const CapacityBytes int64 = 750 * 1024 * 1024 * 1024
+const CapacityBytes int64 = 1500 * 1024 * 1024 * 1024
 
 type Store struct {
 	db *sql.DB
@@ -34,6 +35,14 @@ type Progress struct {
 	Bytes  int64
 }
 
+// Cell is one work item (a workload range inside a 6h chunk) and its lease state.
+type Cell struct {
+	Chunk int    `json:"chunk"`
+	State string `json:"state"`
+	WlLo  int    `json:"wlLo"`
+	WlHi  int    `json:"wlHi"`
+}
+
 type Session struct {
 	ID            string    `json:"id"`
 	Dataset       string    `json:"dataset"`
@@ -47,13 +56,25 @@ type Session struct {
 }
 
 type ExportRow struct {
-	Name      string `json:"name"`
-	Dataset   string `json:"dataset"`
-	Phase     string `json:"phase"`
-	StartTime string `json:"startTime"`
-	Blocks    int    `json:"blocks"`
-	Bytes     int64  `json:"bytes"`
-	URL       string `json:"url"`
+	Name        string `json:"name"`
+	Dataset     string `json:"dataset"`
+	Phase       string `json:"phase"`
+	Type        string `json:"type"`
+	SessionID   string `json:"sessionId,omitempty"`
+	Anchor      string `json:"anchor,omitempty"`
+	StartTime   string `json:"startTime"`
+	EndTime     string `json:"endTime,omitempty"`
+	Interval    string `json:"interval,omitempty"`
+	Blocks      int    `json:"blocks"`
+	BlocksTotal int    `json:"blocksTotal"`
+	Bytes       int64  `json:"bytes"`
+	Workers     int    `json:"workers,omitempty"`
+	Heap        int64  `json:"heap,omitempty"`
+	Budget      int64  `json:"budget,omitempty"`
+	URL         string `json:"url"`
+	StartedAt   int64  `json:"startedAt,omitempty"`
+	FinishedAt  int64  `json:"finishedAt,omitempty"`
+	CreatedAt   int64  `json:"createdAt,omitempty"`
 }
 
 func Open(dir string) (*Store, error) {
@@ -131,6 +152,50 @@ CREATE TABLE IF NOT EXISTS events (
   dataset TEXT,
   message TEXT
 );`)
+	if err != nil {
+		return err
+	}
+	alters := []string{
+		`ALTER TABLE exports ADD COLUMN type TEXT NOT NULL DEFAULT 'thanos'`,
+		`ALTER TABLE exports ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE exports ADD COLUMN anchor TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE exports ADD COLUMN end_time TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE exports ADD COLUMN interval TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE exports ADD COLUMN blocks_total INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE exports ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE exports ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE exports ADD COLUMN workers INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE exports ADD COLUMN heap INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE exports ADD COLUMN budget INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE exports ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE datasets ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE datasets ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, q := range alters {
+		if _, err := s.db.Exec(q); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE exports SET created_at=? WHERE created_at=0`, time.Now().Unix()); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS export_blocks (
+  export_name TEXT NOT NULL,
+  id TEXT NOT NULL,
+  chunk INTEGER NOT NULL,
+  item_index INTEGER NOT NULL,
+  wl_lo INTEGER NOT NULL,
+  wl_hi INTEGER NOT NULL,
+  step_lo INTEGER NOT NULL,
+  step_hi INTEGER NOT NULL,
+  emit_ns INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL,
+  owner TEXT,
+  expiry INTEGER NOT NULL DEFAULT 0,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  bytes INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (export_name, id)
+)`)
 	return err
 }
 
@@ -275,6 +340,23 @@ func (s *Store) Fail(dataset, id, worker, msg string, retryable bool) error {
 	return nil
 }
 
+func (s *Store) Cells(dataset string) ([]Cell, error) {
+	rows, err := s.db.Query(`SELECT chunk, state, wl_lo, wl_hi FROM items WHERE dataset=? ORDER BY chunk, item_index`, dataset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Cell
+	for rows.Next() {
+		var c Cell
+		if err := rows.Scan(&c.Chunk, &c.State, &c.WlLo, &c.WlHi); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Progress(dataset string) (Progress, error) {
 	var p Progress
 	err := s.db.QueryRow(`SELECT
@@ -400,40 +482,95 @@ func (s *Store) CloseSession(id string) error {
 	return err
 }
 
-func (s *Store) UpsertExport(row ExportRow) error {
-	_, err := s.db.Exec(`INSERT INTO exports(name, dataset, phase, start_time, blocks, bytes, url, updated_at)
-VALUES(?,?,?,?,?,?,?,?)
-ON CONFLICT(name) DO UPDATE SET phase=excluded.phase, start_time=excluded.start_time, blocks=excluded.blocks,
-  bytes=excluded.bytes, url=excluded.url, updated_at=excluded.updated_at`,
-		row.Name, row.Dataset, row.Phase, row.StartTime, row.Blocks, row.Bytes, row.URL, time.Now().Unix())
+func (s *Store) SaveExport(row ExportRow) error {
+	if row.Type == "" {
+		row.Type = "thanos"
+	}
+	created := row.CreatedAt
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	_, err := s.db.Exec(`INSERT INTO exports(name, dataset, phase, start_time, blocks, bytes, url, updated_at, type, session_id, anchor, end_time, interval, blocks_total, started_at, created_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(name) DO UPDATE SET dataset=excluded.dataset, phase=excluded.phase, start_time=excluded.start_time,
+  blocks=excluded.blocks, bytes=excluded.bytes, url=excluded.url, updated_at=excluded.updated_at,
+  type=excluded.type, session_id=excluded.session_id, anchor=excluded.anchor, end_time=excluded.end_time,
+  interval=excluded.interval, blocks_total=excluded.blocks_total, started_at=excluded.started_at,
+  created_at=CASE WHEN exports.created_at=0 THEN excluded.created_at ELSE exports.created_at END`,
+		row.Name, row.Dataset, row.Phase, row.StartTime, row.Blocks, row.Bytes, row.URL, time.Now().Unix(),
+		row.Type, row.SessionID, row.Anchor, row.EndTime, row.Interval, row.BlocksTotal, row.StartedAt, created)
 	return err
 }
 
+func (s *Store) TouchExport(name, phase string, blocks, total int, bytes int64, url string, startedAt int64) error {
+	now := time.Now().Unix()
+	_, err := s.db.Exec(`UPDATE exports SET phase=?, blocks=?, blocks_total=?, bytes=?, url=CASE WHEN ?='' THEN url ELSE ? END, started_at=CASE WHEN ?>0 THEN ? ELSE started_at END, updated_at=? WHERE name=?`,
+		phase, blocks, total, bytes, url, url, startedAt, startedAt, now, name)
+	if err != nil {
+		return err
+	}
+	if phase == "Building" {
+		_, err = s.db.Exec(`UPDATE exports SET finished_at=0 WHERE name=?`, name)
+		return err
+	}
+	if phase == "Serving" || phase == "Failed" {
+		_, err = s.db.Exec(`UPDATE exports SET finished_at=? WHERE name=? AND finished_at=0 AND started_at>0`, now, name)
+	}
+	return err
+}
+
+func (s *Store) GenerationTimes(name string) (started, finished int64, err error) {
+	err = s.db.QueryRow(`SELECT COALESCE(started_at,0), COALESCE(finished_at,0) FROM datasets WHERE name=?`, name).Scan(&started, &finished)
+	if err == sql.ErrNoRows {
+		return 0, 0, nil
+	}
+	return started, finished, err
+}
+
+func (s *Store) MarkGenerationStart(name string) error {
+	_, err := s.db.Exec(`UPDATE datasets SET started_at=? WHERE name=? AND started_at=0`, time.Now().Unix(), name)
+	return err
+}
+
+func (s *Store) MarkGenerationFinish(name string) error {
+	_, err := s.db.Exec(`UPDATE datasets SET finished_at=? WHERE name=? AND finished_at=0 AND started_at>0`, time.Now().Unix(), name)
+	return err
+}
+
+func (s *Store) TouchExportLive(name string, workers int, heap, budget int64) error {
+	_, err := s.db.Exec(`UPDATE exports SET workers=?, heap=?, budget=?, updated_at=? WHERE name=?`,
+		workers, heap, budget, time.Now().Unix(), name)
+	return err
+}
+
+func (s *Store) UpsertExport(row ExportRow) error {
+	return s.SaveExport(row)
+}
+
+func scanExport(row *ExportRow, scan func(dest ...any) error) error {
+	return scan(&row.Name, &row.Dataset, &row.Phase, &row.StartTime, &row.Blocks, &row.Bytes, &row.URL,
+		&row.Type, &row.SessionID, &row.Anchor, &row.EndTime, &row.Interval, &row.BlocksTotal, &row.StartedAt, &row.CreatedAt,
+		&row.Workers, &row.Heap, &row.Budget, &row.FinishedAt)
+}
+
+const exportCols = `name, dataset, phase, COALESCE(start_time,''), blocks, bytes, COALESCE(url,''), COALESCE(type,'thanos'), COALESCE(session_id,''), COALESCE(anchor,''), COALESCE(end_time,''), COALESCE(interval,''), COALESCE(blocks_total,0), COALESCE(started_at,0), COALESCE(created_at,0), COALESCE(workers,0), COALESCE(heap,0), COALESCE(budget,0), COALESCE(finished_at,0)`
+
 func (s *Store) GetExport(name string) (ExportRow, error) {
 	var row ExportRow
-	var url sql.NullString
-	var start sql.NullString
-	err := s.db.QueryRow(`SELECT name, dataset, phase, start_time, blocks, bytes, url FROM exports WHERE name=?`, name).
-		Scan(&row.Name, &row.Dataset, &row.Phase, &start, &row.Blocks, &row.Bytes, &url)
-	row.StartTime = start.String
-	row.URL = url.String
+	err := scanExport(&row, s.db.QueryRow(`SELECT `+exportCols+` FROM exports WHERE name=?`, name).Scan)
 	return row, err
 }
 
 func (s *Store) ListExports() ([]ExportRow, error) {
-	rows, err := s.db.Query(`SELECT name FROM exports ORDER BY name`)
+	rows, err := s.db.Query(`SELECT ` + exportCols + ` FROM exports ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []ExportRow
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		row, err := s.GetExport(name)
-		if err != nil {
+		var row ExportRow
+		if err := scanExport(&row, rows.Scan); err != nil {
 			return nil, err
 		}
 		out = append(out, row)
@@ -467,6 +604,10 @@ func (s *Store) Storage() (used int64, datasets []StorageDataset, exports []Expo
 		used += d.Bytes
 		datasets = append(datasets, d)
 	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, nil, err
+	}
+	rows.Close()
 	exports, err = s.ListExports()
 	if err != nil {
 		return 0, nil, nil, err
