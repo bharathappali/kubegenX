@@ -1,7 +1,23 @@
 #!/usr/bin/env bash
 # Idempotent install of KubeGenX onto the only reachable OpenShift cluster.
+# Existing datasets and exports are kept. Pass --clean-on-start to delete them.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CLEAN=0
+for arg in "$@"; do
+  case "$arg" in
+    --clean-on-start) CLEAN=1 ;;
+    -h|--help)
+      echo "usage: hack/deploy.sh [--clean-on-start]"
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $arg" >&2
+      echo "usage: hack/deploy.sh [--clean-on-start]" >&2
+      exit 1
+      ;;
+  esac
+done
 export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 CTX="default/api-cluster-6x4ft-6x4ft-sandbox1763-opentlc-com:6443/kube:admin"
 NS="kube-gen-x"
@@ -113,11 +129,12 @@ rm -rf "$TMP"
 
 oc rollout status deployment/kubegenx-controller -n "$NS" --timeout=600s
 
-# Mountpoint returns EPERM on O_TRUNC of an existing object. The prefix survives
-# PV deletion (reclaim Retain, objects stay in the bucket), so each install
-# removes the previous datasets and exports before anything writes again.
-oc delete pod -n "$NS" kgx-wipe --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
-oc apply -f - <<EOF
+if [[ "$CLEAN" -eq 1 ]]; then
+  # Mountpoint returns EPERM on O_TRUNC of an existing object. The prefix survives
+  # PV deletion (reclaim Retain, objects stay in the bucket).
+  echo "clean-on-start: removing /data/datasets and /data/exports"
+  oc delete pod -n "$NS" kgx-wipe --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+  oc apply -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -136,7 +153,7 @@ spec:
   containers:
     - name: datasets
       image: quay.io/bharathappali/kube-gen-x:tools-v0.1.0
-      imagePullPolicy: IfNotPresent
+      imagePullPolicy: Always
       command: ["/tools", "rm", "/data/datasets"]
       securityContext:
         runAsNonRoot: true
@@ -148,7 +165,7 @@ spec:
           mountPath: /data
     - name: exports
       image: quay.io/bharathappali/kube-gen-x:tools-v0.1.0
-      imagePullPolicy: IfNotPresent
+      imagePullPolicy: Always
       command: ["/tools", "rm", "/data/exports"]
       securityContext:
         runAsNonRoot: true
@@ -163,9 +180,12 @@ spec:
       persistentVolumeClaim:
         claimName: kubegenx-data
 EOF
-if ! oc wait -n "$NS" --for=jsonpath='{.status.phase}'=Succeeded pod/kgx-wipe --timeout=300s; then
-  oc logs -n "$NS" pod/kgx-wipe --all-containers || true
-  exit 1
+  if ! oc wait -n "$NS" --for=jsonpath='{.status.phase}'=Succeeded pod/kgx-wipe --timeout=300s; then
+    oc logs -n "$NS" pod/kgx-wipe --all-containers || true
+    exit 1
+  fi
+  oc delete pod -n "$NS" kgx-wipe --wait=false >/dev/null 2>&1 || true
+else
+  echo "keeping existing datasets and exports"
 fi
-oc delete pod -n "$NS" kgx-wipe --wait=false >/dev/null 2>&1 || true
 echo "deployed uid=${RUN_UID} fsgroup=${FS_GID} bucket=${BUCKET}"

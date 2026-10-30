@@ -9,7 +9,7 @@ These are the places v1 differs from `instruct/design.md` so the workload can ru
 - TSDB blocks are written with Prometheus `BlockWriter` on an `emptyDir` (`/scratch`, `TMPDIR=/scratch`) and copied as complete files to `/data/exports/<dataset>/<export>/tsdb/<ULID>/`. Thanos store mounts that prefix read-only. Its index-header cache is an `emptyDir`.
 - Startup still runs a flock self-test on `kubegenx-data`. When the lock or the directory create fails, the log records `scratchMode=always`. Export always uses the scratch path.
 - Mount options add `allow-other`, `file-mode 0666`, and `dir-mode 0777` so the restricted-v2 UID can write through Mountpoint. `prefix kubegenx/` isolates this PV from the bucket's other claim.
-- Mountpoint rejects `O_TRUNC` on an object that already exists (`operation not permitted`). Deleting the PV does not delete the bucket prefix, so `deploy.sh` runs a tools pod that removes `/data/datasets` and `/data/exports` before the controller writes a new plan.
+- Mountpoint rejects `O_TRUNC` on an object that already exists (`operation not permitted`). Deleting the PV does not delete the bucket prefix. `hack/deploy.sh --clean-on-start` runs a tools pod that removes `/data/datasets` and `/data/exports`. A plain `hack/deploy.sh` leaves those directories in place.
 
 ## Generation
 

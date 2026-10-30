@@ -233,7 +233,7 @@ curl -sS -X POST "$BASE/api/v1/exports" \
 {"name":"g3k1p0q9abcd","sessionId":"g3k1p0q9abcd","startTime":"...","endTime":"...","type":"generic"}
 ```
 
-Use `sessionId` for every later call. Then serve and wait for `Serving`, the same way as Thanos:
+Use `sessionId` for every later call. Then serve and wait for `Serving`:
 
 ```bash
 SID=g3k1p0q9abcd
@@ -241,33 +241,38 @@ curl -sS -X POST "$BASE/api/v1/exports/$SID/serve"
 curl -sS "$BASE/api/v1/exports/$SID"
 ```
 
-There is no separate host. The URLs are on `$BASE`, and they answer only while `phase` is `Serving` (`409` with `session is not serving` before that):
+Serve does not read samples and does not build a results file. It checks the interval and marks the session `Serving`. Thanos exports still convert blocks on this same call. Aggregation answers only while `phase` is `Serving` (`409` with `session is not serving` before that). There is no separate host.
+
+Namespace and workload lists come from the dataset plan. Creating a dataset writes `plan/catalog.json` (org, cluster, namespace, workload kind and name, pods, container names). An older dataset gets that file the first time namespaces are listed. Parquet files are left as they are. Both lists are 1-based `page`, 100 names per page:
 
 ```bash
-curl -sS "$BASE/api/v1/datasets/demo/sessions/$SID/namespaces"
-# {"sessionId":"...","namespaces":["ns-0","ns-1"]}
+curl -sS "$BASE/api/v1/datasets/demo/sessions/$SID/namespaces?page=1"
+# {"sessionId":"...","page":1,"pageSize":100,"total":2,"pages":1,
+#  "namespaces":["ns-0","ns-1"],
+#  "items":[{"namespace":"ns-0","orgId":"amazan","clusterId":"us-east-1"}]}
 
-curl -sS "$BASE/api/v1/datasets/demo/sessions/$SID/namespaces/ns-0/workloads"
-# {"sessionId":"...","namespace":"ns-0","workloads":[{"name":"...","kind":"Deployment","replicas":2,"containers":["app"]}]}
+curl -sS "$BASE/api/v1/datasets/demo/sessions/$SID/namespaces/ns-0/workloads?page=1"
+# {"sessionId":"...","namespace":"ns-0","page":1,"pageSize":100,"total":1,"pages":1,
+#  "workloads":[{"name":"deploy-0","kind":"Deployment","replicas":2,"containers":["app"],"pods":["deploy-0-abc"],"orgId":"amazan","clusterId":"us-east-1"}]}
+```
 
+`results` computes one 6-hour chunk on request. A dataset chunk is 6 hours, and `pages` is how many of those chunks overlap the session window (`page` is 1-based, so page 1 is the first chunk). Inside that chunk the export interval, often 15 minutes, is aggregated for the namespace or workload you name. The call decodes only the Parquet row groups whose container ids cover that workload.
+
+```bash
 curl -sS -G "$BASE/api/v1/datasets/demo/sessions/$SID/results" \
   --data-urlencode 'namespace=ns-0' \
   --data-urlencode 'workload=deploy-0' \
-  --data-urlencode 'start=2026-10-05T00:00:00Z' \
-  --data-urlencode 'end=2026-10-05T06:00:00Z' \
   --data-urlencode 'page=1'
 ```
 
-`results` query parameters:
-
 | Parameter | Meaning |
 |---|---|
-| `namespace` | Optional filter. |
-| `workload` | Optional filter. |
-| `start`, `end` | RFC3339. Both must sit inside the session window. Omit them to take the whole window. |
-| `page` | 1-based. Each page holds 200 buckets. |
+| `namespace` | Limits the series. Required, together with `workload`, once the dataset has more than 100 container series. |
+| `workload` | Limits the series to one workload in that namespace. |
+| `start`, `end` | RFC3339. Both must sit inside the session window. Omit them to take the whole window. `pages` is then the chunks that overlap that clip. |
+| `page` | 1-based chunk. Each page is one 6-hour chunk, not a fixed row count. |
 
-Each item is one container over one interval:
+`intervals` on the response is how many export-interval slots sit in that chunk. `pages` is the chunk count. Each item is one container over one interval in that chunk. `start` and `end` on the response are the first and last interval on the page. `total` is series × intervals across the selected window. A trailing partial interval is dropped.
 
 ```json
 {
@@ -276,8 +281,8 @@ Each item is one container over one interval:
   "workload": "deploy-0",
   "replicas": 2,
   "container": "app",
-  "start": "2026-10-05T00:00:00Z",
-  "end": "2026-10-05T00:15:00Z",
+  "start": "2026-10-17T00:00:00Z",
+  "end": "2026-10-17T00:15:00Z",
   "metrics": {
     "cpuUsage":    {"min": 0.01, "max": 0.4, "avg": 0.1, "sum": 0.2, "unit": "cores"},
     "cpuThrottle": {"min": 0, "max": 0, "avg": 0, "sum": 0, "unit": "cores"},
@@ -287,7 +292,7 @@ Each item is one container over one interval:
 }
 ```
 
-`cpuRequest`, `cpuLimit`, `memoryRequest`, and `memoryLimit` appear when the plan set them. A trailing partial interval is dropped.
+`cpuRequest`, `cpuLimit`, `memoryRequest`, and `memoryLimit` appear when the plan set them. The interval clock is the session start, which is the date chosen at create time. Sample steps stay the indexes already stored in the chunk files.
 
 The controller deletes a `generic` export 24 hours after `createdAt`. `createdAt` on `GET /api/v1/exports/$SID` is Unix seconds, so the session disappears at `createdAt + 86400`.
 

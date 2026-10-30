@@ -263,6 +263,52 @@ func TestDuplicateFailsClosed(t *testing.T) {
 	}
 }
 
+func TestReplicasShareRequestsAndLimits(t *testing.T) {
+	tpl := spec.DefaultTemplate()
+	tpl.Topology.Mode = "NamespaceMatrix"
+	tpl.Topology.Namespaces.Count = 1
+	tpl.Topology.WorkloadsPerNamespace = 4
+	tpl.Topology.Kinds = map[string]float64{"Deployment": 1}
+	tpl.Topology.Replicas.Buckets = []spec.Bucket{{Range: [2]int{3, 3}, Share: 100}}
+	tpl.Time = spec.Time{Step: "15s", Duration: "1h", Chunk: "1h"}
+	tpl.GPU.Enabled = false
+	plan, err := Build("share", tpl, "2026-10-15T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPod := map[int][]Container{}
+	for _, c := range plan.Containers {
+		byPod[c.PodID] = append(byPod[c.PodID], c)
+	}
+	podsOf := map[int][]Pod{}
+	for _, p := range plan.Pods {
+		podsOf[p.WorkloadID] = append(podsOf[p.WorkloadID], p)
+	}
+	checked := 0
+	for _, w := range plan.Workloads {
+		pods := podsOf[w.ID]
+		if len(pods) < 2 {
+			t.Fatalf("workload %s replicas %d", w.Name, len(pods))
+		}
+		first := map[string]Container{}
+		for _, c := range byPod[pods[0].ID] {
+			first[c.Name] = c
+		}
+		for _, p := range pods[1:] {
+			for _, c := range byPod[p.ID] {
+				src := first[c.Name]
+				if c.CPUReqMilli != src.CPUReqMilli || c.CPULimitMilli != src.CPULimitMilli || c.MemReqBytes != src.MemReqBytes || c.MemLimitBytes != src.MemLimitBytes || c.QoS != src.QoS {
+					t.Fatalf("pod %s container %s req/lim %+v template %+v", p.Name, c.Name, c, src)
+				}
+				checked++
+			}
+		}
+	}
+	if checked < 1 {
+		t.Fatal("no replica containers compared")
+	}
+}
+
 func dns1123(s string) bool {
 	if s == "" || len(s) > 63 {
 		return false

@@ -1,14 +1,12 @@
 package app
 
 import (
-	"encoding/json"
 	"net/http"
-	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"time"
 
+	"github.com/bharathappali/kubegenx/internal/aggregate"
 	"github.com/bharathappali/kubegenx/internal/kruize"
 )
 
@@ -66,12 +64,22 @@ func (a *App) sessionNamespaces(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, err.Error())
 		return
 	}
-	_ = id
-	names := make([]string, 0, len(plan.Namespaces))
+	_ = a.ensureCatalog(r.PathValue("ds"), plan)
+	all := make([]map[string]any, 0, len(plan.Namespaces))
 	for _, n := range plan.Namespaces {
-		names = append(names, n.Name)
+		all = append(all, map[string]any{
+			"namespace": n.Name, "orgId": n.Labels["org_id"], "clusterId": n.Labels["cluster_id"],
+		})
 	}
-	writeJSON(w, 200, map[string]any{"sessionId": id, "namespaces": names})
+	items, page, total, pages := pageOf(all, queryPage(r))
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item["namespace"].(string))
+	}
+	writeJSON(w, 200, map[string]any{
+		"sessionId": id, "page": page, "pageSize": metaPageSize, "total": total, "pages": pages,
+		"namespaces": names, "items": items,
+	})
 }
 
 func (a *App) sessionWorkloads(w http.ResponseWriter, r *http.Request) {
@@ -85,16 +93,22 @@ func (a *App) sessionWorkloads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	want := r.PathValue("ns")
+	var nsLabels map[string]string
 	nsID := -1
 	for _, n := range plan.Namespaces {
 		if n.Name == want {
 			nsID = n.ID
+			nsLabels = n.Labels
 			break
 		}
 	}
 	if nsID < 0 {
 		writeErr(w, 404, "namespace not found")
 		return
+	}
+	pods := map[int][]string{}
+	for _, p := range plan.Pods {
+		pods[p.WorkloadID] = append(pods[p.WorkloadID], p.Name)
 	}
 	ctrs := map[int][]string{}
 	seen := map[int]map[string]bool{}
@@ -108,7 +122,7 @@ func (a *App) sessionWorkloads(w http.ResponseWriter, r *http.Request) {
 		seen[c.WorkloadID][c.Name] = true
 		ctrs[c.WorkloadID] = append(ctrs[c.WorkloadID], c.Name)
 	}
-	var workloads []map[string]any
+	var all []map[string]any
 	for _, wl := range plan.Workloads {
 		if wl.NamespaceID != nsID || (wl.Kind != "Deployment" && wl.Kind != "StatefulSet") {
 			continue
@@ -117,14 +131,21 @@ func (a *App) sessionWorkloads(w http.ResponseWriter, r *http.Request) {
 		if names == nil {
 			names = []string{}
 		}
-		workloads = append(workloads, map[string]any{
-			"name": wl.Name, "kind": wl.Kind, "replicas": wl.Replicas, "containers": names,
+		podNames := pods[wl.ID]
+		if podNames == nil {
+			podNames = []string{}
+		}
+		all = append(all, map[string]any{
+			"name": wl.Name, "kind": wl.Kind, "replicas": wl.Replicas,
+			"containers": names, "pods": podNames,
+			"orgId": nsLabels["org_id"], "clusterId": nsLabels["cluster_id"],
 		})
 	}
-	if workloads == nil {
-		workloads = []map[string]any{}
-	}
-	writeJSON(w, 200, map[string]any{"sessionId": id, "namespace": want, "workloads": workloads})
+	items, page, total, pages := pageOf(all, queryPage(r))
+	writeJSON(w, 200, map[string]any{
+		"sessionId": id, "namespace": want, "page": page, "pageSize": metaPageSize, "total": total, "pages": pages,
+		"workloads": items,
+	})
 }
 
 func (a *App) sessionResults(w http.ResponseWriter, r *http.Request) {
@@ -137,22 +158,29 @@ func (a *App) sessionResults(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "session not found")
 		return
 	}
-	raw, err := os.ReadFile(filepath.Join(a.Data, "exports", row.Dataset, id, "buckets.json"))
+	plan, err := loadPlan(a.Data, row.Dataset)
 	if err != nil {
-		writeErr(w, 404, "results are not ready")
+		writeErr(w, 404, err.Error())
 		return
 	}
-	var doc struct {
-		Start time.Time       `json:"start"`
-		End   time.Time       `json:"end"`
-		Rows  []kruize.Bucket `json:"rows"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	origin, err := time.Parse(time.RFC3339, row.StartTime)
+	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	end, err := time.Parse(time.RFC3339, row.EndTime)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	step := time.Duration(plan.StepSeconds) * time.Second
+	interval, err := aggregate.ParseInterval(row.Interval, step)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	q := r.URL.Query()
-	from, to := doc.Start, doc.End
+	from, to := origin, end
 	if s := q.Get("start"); s != "" {
 		t, err := time.Parse(time.RFC3339, s)
 		if err != nil {
@@ -169,60 +197,60 @@ func (a *App) sessionResults(w http.ResponseWriter, r *http.Request) {
 		}
 		to = t
 	}
-	if from.Before(doc.Start) || to.After(doc.End) {
+	if from.Before(origin) || to.After(end) {
 		writeErr(w, 400, "start and end must sit inside the session window")
 		return
 	}
-	ns, wl := q.Get("namespace"), q.Get("workload")
-	var matched []kruize.Bucket
-	for _, b := range doc.Rows {
-		if !b.Start.Before(to) || !b.End.After(from) {
-			continue
-		}
-		if ns != "" && b.Namespace != ns {
-			continue
-		}
-		if wl != "" && b.Workload != wl {
-			continue
-		}
-		matched = append(matched, b)
+	page := queryPage(r)
+	got, err := kruize.AggregatePage(plan, filepath.Join(a.Data, "datasets", row.Dataset), origin, interval, q.Get("namespace"), q.Get("workload"), from, to, page)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
 	}
-	sort.Slice(matched, func(i, j int) bool {
-		a, b := matched[i], matched[j]
-		if a.Namespace != b.Namespace {
-			return a.Namespace < b.Namespace
-		}
-		if a.Workload != b.Workload {
-			return a.Workload < b.Workload
-		}
-		if a.Container != b.Container {
-			return a.Container < b.Container
-		}
-		return a.Start.Before(b.Start)
-	})
-	if matched == nil {
-		matched = []kruize.Bucket{}
+	if got.Items == nil {
+		got.Items = []kruize.Bucket{}
 	}
-	page, _ := strconv.Atoi(q.Get("page"))
+	body := map[string]any{
+		"sessionId": id, "page": got.Page, "pageSize": got.PageSize, "total": got.Total, "pages": got.Pages,
+		"intervals": got.Intervals, "series": got.Series, "items": got.Items,
+	}
+	if !got.Start.IsZero() {
+		body["start"] = got.Start
+		body["end"] = got.End
+	}
+	writeJSON(w, 200, body)
+}
+
+const metaPageSize = 100
+
+func queryPage(r *http.Request) int {
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
 	}
-	const pageSize = 200
-	total := len(matched)
-	pages := (total + pageSize - 1) / pageSize
-	if pages == 0 {
-		pages = 1
+	return page
+}
+
+func pageOf[T any](all []T, page int) (items []T, pageOut, total, pages int) {
+	total = len(all)
+	pages = 1
+	if total > 0 {
+		pages = (total + metaPageSize - 1) / metaPageSize
 	}
-	i := (page - 1) * pageSize
+	if page > pages {
+		page = pages
+	}
+	i := (page - 1) * metaPageSize
 	if i > total {
 		i = total
 	}
-	j := i + pageSize
+	j := i + metaPageSize
 	if j > total {
 		j = total
 	}
-	writeJSON(w, 200, map[string]any{
-		"sessionId": id, "page": page, "pageSize": pageSize, "total": total, "pages": pages,
-		"items": matched[i:j],
-	})
+	items = all[i:j]
+	if items == nil {
+		items = []T{}
+	}
+	return items, page, total, pages
 }

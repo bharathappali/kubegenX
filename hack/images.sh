@@ -5,8 +5,30 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 REG="${REG:-quay.io/bharathappali/kube-gen-x}"
-VER="${VERSION:-v0.1.0}"
+VER="${VERSION:-v0.1.1}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
+
+# The image Dockerfiles copy bin/<name>-<arch>. Compile those from this tree
+# so a pushed tag is not an older binary left in bin/.
+compile_go() {
+  local name="$1" pkg="$2" platform arch
+  IFS=',' read -r -a archs <<< "$PLATFORMS"
+  for platform in "${archs[@]}"; do
+    case "$platform" in
+      linux/amd64) arch=amd64 ;;
+      linux/arm64) arch=arm64 ;;
+      *) echo "unsupported platform $platform" >&2; exit 1 ;;
+    esac
+    echo "compiling ${name}-${arch}"
+    ( cd controller && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o "../bin/${name}-${arch}" "$pkg" )
+  done
+}
+
+rm -f bin/controller bin/controller-* bin/converter bin/converter-* bin/tools bin/tools-*
+mkdir -p bin
+compile_go controller ./cmd/controller
+compile_go converter ./cmd/converter
+compile_go tools ./cmd/tools
 
 push_one() {
   local name="$1" file="$2"
@@ -40,7 +62,7 @@ push_one converter docker/converter.Dockerfile
 push_one worker docker/worker.Dockerfile
 push_one tools docker/tools.Dockerfile
 if [[ "${SKIP_PUSH:-}" == "1" ]]; then
-  echo "built ${REG} controller/worker/tools ${VER} locally"
+  echo "built ${REG} controller/converter/worker/tools ${VER} locally"
 else
-  echo "pushed ${REG} controller/worker/tools ${VER} and latest"
+  echo "pushed ${REG} controller/converter/worker/tools ${VER} and latest"
 fi

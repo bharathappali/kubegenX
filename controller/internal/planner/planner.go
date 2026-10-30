@@ -352,6 +352,14 @@ func (p *Plan) assignPodsAndContainers(tpl spec.Template) {
 	for _, w := range p.Workloads {
 		nCont := pickContainerCount(tpl.Seed, uint32(w.ID), tpl.Topology.ContainersPerPod)
 		names := containerNames(tpl.Seed, uint32(w.ID), w.Name, nCont)
+		// Requests and limits come from the pod template, so every replica of a
+		// container shares them. Usage means stay per replica.
+		type sharedSpec struct {
+			req, lim   uint32
+			mreq, mlim int64
+			qos        string
+		}
+		shared := make([]sharedSpec, len(names))
 		for r := 0; r < w.Replicas; r++ {
 			var podName string
 			if w.Kind == "StatefulSet" {
@@ -402,6 +410,12 @@ func (p *Plan) assignPodsAndContainers(tpl spec.Template) {
 				mem := generate.PickBytes(tpl.Seed, uint32(cid), mlo, mhi)
 				sizing := pickSizing(tpl, uint32(cid))
 				req, lim, mreq, mlim, qos := applySizing(sizing, mean, mem)
+				if r == 0 {
+					shared[i] = sharedSpec{req, lim, mreq, mlim, qos}
+				} else {
+					s := shared[i]
+					req, lim, mreq, mlim, qos = s.req, s.lim, s.mreq, s.mlim, s.qos
+				}
 				restart := -1
 				if pickAnomaly(tpl, uint32(cid)) == "oomLoop" {
 					restart = p.Steps / 3

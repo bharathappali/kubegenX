@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/bharathappali/kubegenx/internal/aggregate"
-	"github.com/bharathappali/kubegenx/internal/kruize"
 	"github.com/bharathappali/kubegenx/internal/planner"
 	"github.com/bharathappali/kubegenx/internal/spec"
 	"github.com/bharathappali/kubegenx/internal/store"
@@ -254,6 +253,9 @@ func (a *App) planDataset(cm *corev1.ConfigMap, name string, ds spec.Dataset) er
 	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), man, 0o664)
 	if rawWL, err := json.Marshal(workloadBriefs(plan)); err == nil {
 		_ = os.WriteFile(filepath.Join(dir, "workloads.json"), rawWL, 0o664)
+	}
+	if err := writeCatalog(dir, plan); err != nil {
+		return err
 	}
 	if err := a.Store.UpsertDataset(name, "Generating", plan.Digest, est, reserved); err != nil {
 		return err
@@ -623,37 +625,48 @@ func (a *App) buildGeneric(cm *corev1.ConfigMap, name, dsName string, plan *plan
 		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
 		return
 	}
-	_ = a.Store.TouchExport(name, "Building", 0, 0, 0, "", started)
-	rows, err := kruize.Buckets(plan, filepath.Join(a.Data, "datasets", dsName), start, interval)
-	if err != nil {
-		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
-		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
-		return
+	n := 0
+	if interval > 0 {
+		n = plan.Steps / int(interval/step)
 	}
-	dir := filepath.Join(a.Data, "exports", dsName, name)
+	pages := plan.Chunks
+	if pages < 1 {
+		cs := plan.ChunkSamples
+		if cs < 1 {
+			cs = 1
+		}
+		pages = (plan.Steps + cs - 1) / cs
+	}
+	if pages < 1 {
+		pages = 1
+	}
+	_ = a.ensureCatalog(dsName, plan)
+	_ = a.Store.TouchExport(name, "Serving", 0, 0, 0, "", started)
+	a.writeStatus(cm, name, map[string]any{
+		"phase": "Serving", "sessionId": ex.SessionID,
+		"startTime": start.UTC().Format(time.RFC3339), "endTime": end.UTC().Format(time.RFC3339),
+		"interval": ex.Interval, "intervals": n, "pages": pages,
+	})
+}
+
+func writeCatalog(dir string, plan *planner.Plan) error {
+	raw, err := json.MarshalIndent(planner.Catalog(plan), "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "catalog.json"), raw, 0o664)
+}
+
+func (a *App) ensureCatalog(dataset string, plan *planner.Plan) error {
+	dir := filepath.Join(a.Data, "datasets", dataset, "plan")
+	path := filepath.Join(dir, "catalog.json")
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
 	if err := os.MkdirAll(dir, 0o775); err != nil {
-		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
-		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
-		return
+		return err
 	}
-	raw, err := json.Marshal(map[string]any{"start": start, "end": end, "interval": ex.Interval, "rows": rows})
-	if err != nil {
-		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
-		return
-	}
-	path := filepath.Join(dir, "buckets.json")
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
-		_ = a.Store.TouchExport(name, "Failed", 0, 0, 0, "", started)
-		a.writeStatus(cm, name, map[string]any{"phase": "Failed", "error": err.Error()})
-		return
-	}
-	info, _ := os.Stat(path)
-	var n int64
-	if info != nil {
-		n = info.Size()
-	}
-	_ = a.Store.TouchExport(name, "Serving", len(rows), len(rows), n, "", started)
-	a.writeStatus(cm, name, map[string]any{"phase": "Serving", "sessionId": ex.SessionID, "startTime": start.UTC().Format(time.RFC3339), "endTime": end.UTC().Format(time.RFC3339), "interval": ex.Interval})
+	return writeCatalog(dir, plan)
 }
 
 func (a *App) cleanupExport(cm *corev1.ConfigMap, name string) {
@@ -774,7 +787,7 @@ func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string)
 					SecurityContext:              podSC(),
 					Containers: []corev1.Container{
 						{
-							Name: "store", Image: a.ThanosImage, ImagePullPolicy: corev1.PullIfNotPresent,
+							Name: "store", Image: a.ThanosImage, ImagePullPolicy: corev1.PullAlways,
 							Args: []string{"store", "--objstore.config-file=/etc/thanos/objstore.yml", "--data-dir=/cache",
 								"--grpc-address=0.0.0.0:10901", "--http-address=0.0.0.0:10902",
 								"--store.enable-index-header-lazy-reader", "--sync-block-duration=30s"},
@@ -787,7 +800,7 @@ func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string)
 							},
 						},
 						{
-							Name: "query", Image: a.ThanosImage, ImagePullPolicy: corev1.PullIfNotPresent,
+							Name: "query", Image: a.ThanosImage, ImagePullPolicy: corev1.PullAlways,
 							Args:            []string{"query", "--endpoint=127.0.0.1:10901", "--http-address=0.0.0.0:9090", "--grpc-address=127.0.0.1:10911"},
 							Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: 9090}},
 							SecurityContext: containerSC(),

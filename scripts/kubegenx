@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""KubeGenX command line.
+
+Reads KUBE_GENX_URL. Progress stays on stderr. create and export print one
+JSON document on stdout so a shell script can read the dataset name and pass
+it to the next subcommand.
+
+  export KUBE_GENX_URL=https://kubegenx-kube-gen-x.apps.example.com
+  details=$(scripts/kubegenx create --name demo --days 1)
+  name=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$details")
+  scripts/kubegenx export --dataset "$name"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BAR_WIDTH = 40
+NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
+EFFORTS = ("low", "medium", "high", "xhigh")
+STEPS = ("15s", "30s", "45s", "60s")
+
+LEFT = (
+    "admiring", "bold", "brave", "calm", "clever", "eager", "elegant",
+    "focused", "friendly", "happy", "keen", "kind", "lucid", "peaceful",
+    "quirky", "serene", "sharp", "swift", "vigilant", "zen",
+)
+RIGHT = (
+    "curie", "hopper", "knuth", "liskov", "lovelace", "noyce", "ritchie",
+    "shannon", "tesla", "turing", "williams", "wozniak",
+)
+
+
+class APIError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def die(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def base_url(args: argparse.Namespace) -> str:
+    raw = (args.url or os.environ.get("KUBE_GENX_URL") or "").strip().rstrip("/")
+    if not raw:
+        die("set KUBE_GENX_URL to the controller URL, or pass --url")
+    if "://" not in raw:
+        raw = "https://" + raw
+    return raw
+
+
+def ssl_context(args: argparse.Namespace) -> ssl.SSLContext:
+    insecure = args.insecure or os.environ.get("KUBE_GENX_INSECURE", "").lower() in ("1", "true", "yes")
+    if insecure:
+        return ssl._create_unverified_context()
+    return ssl.create_default_context()
+
+
+def request(args: argparse.Namespace, method: str, path: str, body: dict | None = None) -> dict:
+    url = base_url(args) + path
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=args.timeout, context=ssl_context(args)) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as err:
+        raw = err.read()
+        message = _error_message(raw, err.reason)
+        raise APIError(err.code, message) from None
+    except urllib.error.URLError as err:
+        raise APIError(0, f"cannot reach {url}: {err.reason}") from None
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw.decode())
+    except json.JSONDecodeError as err:
+        raise APIError(0, f"response from {path} was not JSON") from err
+    if not isinstance(parsed, dict):
+        return {"value": parsed}
+    return parsed
+
+
+def _error_message(raw: bytes, fallback) -> str:
+    text = raw.decode(errors="replace").strip()
+    try:
+        payload = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return text or str(fallback)
+    if isinstance(payload, dict):
+        return str(payload.get("reason") or payload.get("error") or fallback)
+    return text or str(fallback)
+
+
+def emit(doc: dict) -> None:
+    json.dump(doc, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def check_name(name: str) -> str:
+    if not NAME_RE.match(name) or "--" in name:
+        die("name must be a lowercase DNS label of at most 40 characters")
+    return name
+
+
+def random_name() -> str:
+    for _ in range(32):
+        name = f"{random.choice(LEFT)}-{random.choice(RIGHT)}"
+        if name != "boring-wozniak" and len(name) <= 40:
+            return name
+    return "keen-turing"
+
+
+def percent_of(doc: dict) -> float:
+    if doc.get("percent") is not None:
+        return float(doc["percent"])
+    progress = doc.get("progress")
+    if isinstance(progress, dict) and progress.get("percent") is not None:
+        return float(progress["percent"])
+    kpi = doc.get("kpi")
+    if isinstance(kpi, dict) and kpi.get("percent") is not None:
+        return float(kpi["percent"])
+    phase = str(doc.get("phase") or "")
+    if phase in ("Ready", "Serving"):
+        return 100.0
+    return 0.0
+
+
+def bar(percent: float) -> str:
+    pct = max(0.0, min(100.0, percent))
+    filled = int(round(BAR_WIDTH * pct / 100.0))
+    if pct >= 100:
+        filled = BAR_WIDTH
+    elif pct > 0 and filled == 0:
+        filled = 1
+    return "#" * filled + "-" * (BAR_WIDTH - filled)
+
+
+def draw_status(label: str, doc: dict, final: bool = False) -> None:
+    pct = percent_of(doc)
+    phase = str(doc.get("phase") or "")
+    items = doc.get("items") if isinstance(doc.get("items"), dict) else {}
+    extra = ""
+    if items.get("total"):
+        extra = f"  {items.get('done', 0)}/{items.get('total', 0)}"
+    elif doc.get("blocksTotal"):
+        extra = f"  {doc.get('blocks', 0)}/{doc.get('blocksTotal', 0)} blocks"
+    line = f"[{bar(pct)}] {pct:6.1f}%  {phase:<12}{extra}  {label}"
+    stream = sys.stderr
+    if stream.isatty():
+        stream.write("\r" + line + " " * 8)
+        if final:
+            stream.write("\n")
+    else:
+        stream.write(line + "\n")
+    stream.flush()
+
+
+def poll(args: argparse.Namespace, label: str, path: str, done: set[str], failed: set[str]) -> dict:
+    deadline = time.monotonic() + args.wait if args.wait else None
+    last = None
+    while True:
+        doc = request(args, "GET", path)
+        phase = str(doc.get("phase") or "")
+        finished = phase in done or phase in failed
+        signature = (phase, round(percent_of(doc), 1), doc.get("blocks"), doc.get("items", {}).get("done") if isinstance(doc.get("items"), dict) else None)
+        if finished or sys.stderr.isatty() or signature != last:
+            draw_status(label, doc, final=finished)
+        last = signature
+        if phase in failed:
+            emit(doc)
+            die(f"{label} {phase}", 1)
+        if phase in done:
+            return doc
+        if deadline is not None and time.monotonic() >= deadline:
+            emit(doc)
+            die(f"timed out waiting for {label} ({phase or 'unknown'})", 1)
+        time.sleep(args.poll)
+
+
+def build_spec(args: argparse.Namespace) -> dict:
+    percent = float(args.gpu_percent)
+    mode = "TotalWorkloads" if args.shape == "workloads" else "NamespaceMatrix"
+    if mode == "TotalWorkloads":
+        namespaces = {"count": 0, "distribution": "Zipf", "zipfS": 1}
+    else:
+        namespaces = {"count": args.namespaces, "distribution": "Uniform", "zipfS": 0}
+    return {
+        "seed": args.seed,
+        "topology": {
+            "mode": mode,
+            "totalWorkloads": args.workloads,
+            "namespaces": namespaces,
+            "workloadsPerNamespace": args.per_namespace,
+            "kinds": {"Deployment": 0.8, "StatefulSet": 0.2},
+            "replicas": {
+                "buckets": [
+                    {"range": [1, 3], "share": 70},
+                    {"range": [4, 7], "share": 22},
+                    {"range": [8, 10], "share": 8},
+                ],
+                "statefulSetBuckets": [
+                    {"range": [1, 3], "share": 85},
+                    {"range": [4, 7], "share": 15},
+                ],
+            },
+            "containersPerPod": {"1": 0.75, "2": 0.18, "3": 0.07},
+        },
+        "profiles": {
+            "cpu": {"idle": 0.15, "low": 0.4, "medium": 0.3, "high": 0.15},
+            "memory": {"low": 0.35, "medium": 0.45, "high": 0.2},
+            "sizing": {"rightSized": 0.45, "over": 0.3, "under": 0.1, "noLimits": 0.1, "bestEffort": 0.05},
+            "behaviours": {"steady": 0.3, "diurnal": 0.4, "bursty": 0.15, "batchOnOff": 0.1, "idleWindows": 0.05},
+            "anomalies": {"throttleAggressive": 0.08, "memoryLeak": 0.03, "oomLoop": 0.01, "spikes": 0.1},
+        },
+        "gpu": {
+            "enabled": percent > 0,
+            "workloadRatio": percent / 100.0,
+            "nodePools": ["p4d.24xlarge"],
+            "migRatio": 0.3,
+            "labelProfile": "kruize",
+        },
+        "nodes": {
+            "pools": [{"instanceType": "m7i.4xlarge", "weight": 1}],
+            "maxPodsPerNode": 250,
+        },
+        "time": {"step": args.step, "duration": f"{args.days}d", "chunk": "6h"},
+        "features": ["cpu", "memory", "gpu", "ksm"],
+        "workloadLabels": {
+            "scope": "namespace",
+            "keys": [{"key": "org_id"}, {"key": "cluster_id"}],
+            "carryOn": ["namespace", "ksm-pod", "ksm-container", "recorded", "cadvisor"],
+        },
+        "workers": {
+            "cpu": args.workers_cpu,
+            "memory": args.workers_memory,
+            "threads": args.workers_threads,
+        },
+        "workItem": {"workloadsPerItem": 1024},
+    }
+
+
+def cmd_create(args: argparse.Namespace) -> None:
+    name = check_name(args.name or random_name())
+    spec = build_spec(args)
+    request(args, "POST", "/api/v1/templates", {"name": name, "spec": spec})
+    body = {
+        "name": name,
+        "template": name,
+        "effort": args.effort,
+        "workers": {
+            "cpu": args.workers_cpu,
+            "memory": args.workers_memory,
+            "threads": args.workers_threads,
+        },
+    }
+    if args.epoch:
+        body["epoch"] = args.epoch
+    created = request(args, "POST", "/api/v1/datasets", body)
+    if args.no_wait:
+        emit({"name": created.get("name", name), "phase": "Accepted"})
+        return
+    doc = poll(args, name, f"/api/v1/datasets/{name}", {"Ready"}, {"Failed"})
+    try:
+        layout = request(args, "GET", f"/api/v1/datasets/{name}/layout")
+    except APIError:
+        layout = {}
+    doc["name"] = doc.get("name") or name
+    if layout:
+        doc["layout"] = {
+            "epoch": layout.get("epoch"),
+            "chunks": layout.get("chunks"),
+            "stepSeconds": layout.get("stepSeconds"),
+            "workloads": layout.get("workloads"),
+            "namespaces": len(layout.get("namespaces") or []),
+        }
+    emit(doc)
+
+
+def _cell(value, width: int) -> str:
+    text = "—" if value is None or value == "" else str(value)
+    if len(text) > width:
+        return text[: width - 1] + "…"
+    return text.ljust(width)
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    doc = request(args, "GET", "/api/v1/datasets")
+    items = doc.get("items") or []
+    if args.json:
+        emit(doc)
+        return
+    if not items:
+        print("no datasets")
+        return
+    header = ("NAME", "PHASE", "PROGRESS", "NAMESPACES", "WORKLOADS", "DAYS", "STEP")
+    rows = []
+    for item in items:
+        progress = item.get("progress") if isinstance(item.get("progress"), dict) else {}
+        pct = percent_of({**progress, "phase": item.get("phase") or progress.get("phase")})
+        step = item.get("stepSeconds")
+        rows.append((
+            item.get("name", ""),
+            item.get("phase") or progress.get("phase") or "",
+            f"{pct:.1f}%",
+            item.get("namespaces", ""),
+            item.get("workloads", ""),
+            item.get("days", ""),
+            f"{step}s" if step else "",
+        ))
+    widths = [max(len(header[i]), *(len(str(row[i])) for row in rows)) for i in range(len(header))]
+    print("  ".join(_cell(header[i], widths[i]) for i in range(len(header))))
+    for row in rows:
+        print("  ".join(_cell(row[i], widths[i]) for i in range(len(header))))
+
+
+def cmd_get(args: argparse.Namespace) -> None:
+    name = check_name(args.name)
+    if args.watch:
+        doc = poll(args, name, f"/api/v1/datasets/{name}", {"Ready"}, {"Failed"})
+    else:
+        doc = request(args, "GET", f"/api/v1/datasets/{name}")
+    emit(doc)
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    name = check_name(args.name)
+    emit(request(args, "DELETE", f"/api/v1/datasets/{name}"))
+
+
+def _epoch_time(args: argparse.Namespace, dataset: str) -> str:
+    layout = request(args, "GET", f"/api/v1/datasets/{dataset}/layout")
+    epoch = layout.get("epoch") or ""
+    if not epoch:
+        die(f"dataset {dataset} has no epoch yet; pass --time")
+    return str(epoch)
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    dataset = check_name(args.dataset)
+    when = args.time or _epoch_time(args, dataset)
+    body = {
+        "dataset": dataset,
+        "type": args.type,
+        "anchor": args.anchor,
+        "time": when,
+        "effort": args.effort,
+        "interval": args.interval if args.type == "generic" else "",
+    }
+    created = request(args, "POST", "/api/v1/exports", body)
+    name = created.get("sessionId") or created.get("name") or dataset
+    if args.no_serve:
+        emit(created)
+        return
+    try:
+        request(args, "POST", f"/api/v1/exports/{name}/serve", {})
+    except APIError as err:
+        if err.status != 409:
+            raise
+    doc = poll(args, name, f"/api/v1/exports/{name}", {"Serving"}, {"Failed"})
+    url = str(doc.get("url") or "")
+    if url:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            doc["origin"] = f"{parsed.scheme}://{parsed.netloc}"
+        except ValueError:
+            doc["origin"] = ""
+    emit(doc)
+
+
+def cmd_exports(args: argparse.Namespace) -> None:
+    doc = request(args, "GET", "/api/v1/exports")
+    items = doc.get("items") or []
+    if args.dataset:
+        items = [row for row in items if row.get("dataset") == args.dataset]
+        doc = {"items": items}
+    if args.json:
+        emit(doc)
+        return
+    if not items:
+        print("no exports")
+        return
+    header = ("NAME", "DATASET", "TYPE", "PHASE", "START", "END", "URL")
+    rows = []
+    for item in items:
+        rows.append((
+            item.get("sessionId") or item.get("name") or "",
+            item.get("dataset", ""),
+            item.get("type") or "thanos",
+            item.get("phase", ""),
+            item.get("startTime", ""),
+            item.get("endTime", ""),
+            item.get("url") or "",
+        ))
+    widths = [min(48, max(len(header[i]), *(len(str(row[i])) for row in rows))) for i in range(len(header))]
+    print("  ".join(_cell(header[i], widths[i]) for i in range(len(header))))
+    for row in rows:
+        print("  ".join(_cell(row[i], widths[i]) for i in range(len(header))))
+
+
+def cmd_storage(args: argparse.Namespace) -> None:
+    emit(request(args, "GET", "/api/v1/storage"))
+
+
+def add_http_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--url", help="controller base URL (default: KUBE_GENX_URL)")
+    parser.add_argument("--insecure", action="store_true", help="skip TLS verification (or set KUBE_GENX_INSECURE=1)")
+    parser.add_argument("--timeout", type=float, default=60, help="HTTP timeout in seconds (default: 60)")
+    parser.add_argument("--poll", type=float, default=2, help="seconds between status polls (default: 2)")
+    parser.add_argument("--wait", type=float, default=0, help="give up after this many seconds (default: wait until done)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="kubegenx",
+        description="Create, list, and export KubeGenX datasets. Set KUBE_GENX_URL first.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    create = sub.add_parser("create", help="create a dataset with the same fields as the UI")
+    add_http_flags(create)
+    create.add_argument("--name", help="dataset name (default: a generated name)")
+    create.add_argument("--shape", choices=("namespace", "workloads"), default="namespace", help="by namespace, or by total workloads (default: namespace)")
+    create.add_argument("--namespaces", type=int, default=3, help="namespace count when --shape namespace (default: 3)")
+    create.add_argument("--per-namespace", type=int, default=5, dest="per_namespace", help="workloads in each namespace (default: 5)")
+    create.add_argument("--workloads", type=int, default=15, help="total workloads when --shape workloads (default: 15)")
+    create.add_argument("--gpu-percent", type=float, default=7, dest="gpu_percent", help="percent of workloads with a GPU, 0 disables GPU (default: 7)")
+    create.add_argument("--days", type=int, default=1, help="history length in days (default: 1)")
+    create.add_argument("--step", choices=STEPS, default="15s", help="data interval (default: 15s)")
+    create.add_argument("--effort", choices=EFFORTS, default="xhigh", help="worker effort (default: xhigh)")
+    create.add_argument("--seed", type=int, default=424242, help="scenario seed (default: 424242)")
+    create.add_argument("--epoch", help="RFC3339 start; empty uses the controller default")
+    create.add_argument("--workers-cpu", default="500m", dest="workers_cpu", help="worker CPU request (default: 500m)")
+    create.add_argument("--workers-memory", default="1Gi", dest="workers_memory", help="worker memory request (default: 1Gi)")
+    create.add_argument("--workers-threads", type=int, default=2, dest="workers_threads", help="threads per worker (default: 2)")
+    create.add_argument("--no-wait", action="store_true", help="return after the dataset is accepted, without the status bar")
+    create.set_defaults(func=cmd_create)
+
+    listing = sub.add_parser("list", help="list datasets")
+    add_http_flags(listing)
+    listing.add_argument("--json", action="store_true", help="print the API document")
+    listing.set_defaults(func=cmd_list)
+
+    get = sub.add_parser("get", help="show one dataset")
+    add_http_flags(get)
+    get.add_argument("name")
+    get.add_argument("--watch", action="store_true", help="show the status bar until Ready or Failed")
+    get.set_defaults(func=cmd_get)
+
+    delete = sub.add_parser("delete", help="delete a dataset")
+    add_http_flags(delete)
+    delete.add_argument("name")
+    delete.set_defaults(func=cmd_delete)
+
+    export = sub.add_parser("export", help="create an export, serve it, and wait until Serving")
+    add_http_flags(export)
+    export.add_argument("--dataset", required=True, help="dataset name")
+    export.add_argument("--type", choices=("thanos", "generic"), default="thanos", help="thanos or aggregation API (default: thanos)")
+    export.add_argument("--anchor", choices=("start", "end"), default="start", help="which edge --time sets (default: start)")
+    export.add_argument("--time", help="RFC3339 instant for that edge (default: the dataset epoch)")
+    export.add_argument("--interval", default="15m", help="aggregation interval, generic only (default: 15m)")
+    export.add_argument("--effort", choices=EFFORTS, default="xhigh", help="conversion effort (default: xhigh)")
+    export.add_argument("--no-serve", action="store_true", help="store the window and return without serving")
+    export.set_defaults(func=cmd_export)
+
+    exports = sub.add_parser("exports", help="list exports")
+    add_http_flags(exports)
+    exports.add_argument("--dataset", help="only exports for this dataset")
+    exports.add_argument("--json", action="store_true", help="print the API document")
+    exports.set_defaults(func=cmd_exports)
+
+    storage = sub.add_parser("storage", help="show volume usage")
+    add_http_flags(storage)
+    storage.set_defaults(func=cmd_storage)
+    return parser
+
+
+def validate(args: argparse.Namespace) -> None:
+    if args.command != "create":
+        return
+    if args.days < 1:
+        die("--days must be at least 1")
+    if args.namespaces < 1 or args.per_namespace < 1 or args.workloads < 1:
+        die("counts must be at least 1")
+    if args.gpu_percent < 0 or args.gpu_percent > 100:
+        die("--gpu-percent must be from 0 to 100")
+    if args.workers_threads < 1:
+        die("--workers-threads must be at least 1")
+    if args.seed < 0:
+        die("--seed must be zero or positive")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validate(args)
+    try:
+        args.func(args)
+    except APIError as err:
+        if sys.stderr.isatty():
+            print(file=sys.stderr)
+        prefix = f"HTTP {err.status}: " if err.status else ""
+        die(prefix + str(err))
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        raise SystemExit(130) from None
+
+
+if __name__ == "__main__":
+    main()
