@@ -1,28 +1,72 @@
 #!/usr/bin/env bash
-# Idempotent install of KubeGenX onto the only reachable OpenShift cluster.
+# Install KubeGenX.
+#   hack/deploy.sh                         shared S3 volume (default)
+#   hack/deploy.sh --volume node-local --node <worker>
 # Existing datasets and exports are kept. Pass --clean-on-start to delete them.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VOLUME="s3"
+NODE=""
 CLEAN=0
-for arg in "$@"; do
-  case "$arg" in
-    --clean-on-start) CLEAN=1 ;;
+usage() {
+  echo "usage: hack/deploy.sh [--volume s3|node-local] [--node <worker>] [--clean-on-start]"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --clean-on-start) CLEAN=1; shift ;;
+    --volume)
+      VOLUME="${2:-}"
+      if [[ -z "$VOLUME" ]]; then
+        echo "missing value for --volume" >&2
+        usage >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --node)
+      NODE="${2:-}"
+      if [[ -z "$NODE" ]]; then
+        echo "missing value for --node" >&2
+        usage >&2
+        exit 1
+      fi
+      shift 2
+      ;;
     -h|--help)
-      echo "usage: hack/deploy.sh [--clean-on-start]"
+      usage
       exit 0
       ;;
     *)
-      echo "unknown argument: $arg" >&2
-      echo "usage: hack/deploy.sh [--clean-on-start]" >&2
+      echo "unknown argument: $1" >&2
+      usage >&2
       exit 1
       ;;
   esac
 done
+case "$VOLUME" in
+  s3|node-local) ;;
+  *)
+    echo "volume must be s3 or node-local" >&2
+    exit 1
+    ;;
+esac
+if [[ "$VOLUME" == "node-local" && -z "$NODE" ]]; then
+  echo "node-local requires --node <worker>" >&2
+  exit 1
+fi
+if [[ "$VOLUME" == "s3" && -n "$NODE" ]]; then
+  echo "--node is only used with --volume node-local" >&2
+  exit 1
+fi
+
 export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
-CTX="default/api-cluster-6x4ft-6x4ft-sandbox1763-opentlc-com:6443/kube:admin"
 NS="kube-gen-x"
-oc config use-context "$CTX"
-oc get sc gp3-csi >/dev/null
+if [[ "$VOLUME" == "s3" ]]; then
+  CTX="default/api-cluster-6x4ft-6x4ft-sandbox1763-opentlc-com:6443/kube:admin"
+  oc config use-context "$CTX"
+  oc get sc gp3-csi >/dev/null
+fi
 
 oc apply -f - <<'EOF'
 apiVersion: v1
@@ -43,16 +87,17 @@ if [[ -z "$RUN_UID" || -z "$FS_GID" ]]; then
   exit 1
 fi
 
-BUCKET="${BUCKET:-}"
-if [[ -z "$BUCKET" ]]; then
-  BUCKET="$(oc get pv s3-volume-pv -o jsonpath='{.spec.csi.volumeAttributes.bucketName}' 2>/dev/null || true)"
-fi
-if [[ -z "$BUCKET" ]]; then
-  BUCKET="s3-bucket-6x4ft-for-rwx"
-fi
+if [[ "$VOLUME" == "s3" ]]; then
+  BUCKET="${BUCKET:-}"
+  if [[ -z "$BUCKET" ]]; then
+    BUCKET="$(oc get pv s3-volume-pv -o jsonpath='{.spec.csi.volumeAttributes.bucketName}' 2>/dev/null || true)"
+  fi
+  if [[ -z "$BUCKET" ]]; then
+    BUCKET="s3-bucket-6x4ft-for-rwx"
+  fi
 
-if ! oc get pv kubegenx-data >/dev/null 2>&1; then
-  oc apply -f - <<EOF
+  if ! oc get pv kubegenx-data >/dev/null 2>&1; then
+    oc apply -f - <<EOF
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -79,9 +124,9 @@ spec:
       bucketName: ${BUCKET}
       prefix: kubegenx2/
 EOF
-fi
+  fi
 
-oc apply -f - <<EOF
+  oc apply -f - <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -111,17 +156,105 @@ spec:
     requests:
       storage: 10Gi
 EOF
+else
+  if oc get pv kubegenx-data >/dev/null 2>&1; then
+    driver="$(oc get pv kubegenx-data -o jsonpath='{.spec.csi.driver}' 2>/dev/null || true)"
+    if [[ "$driver" == "s3.csi.aws.com" ]]; then
+      echo "kubegenx-data is the S3 volume on this cluster" >&2
+      exit 1
+    fi
+  else
+    echo "node-local: preparing /mnt/kubegenx on ${NODE}"
+    oc debug "node/${NODE}" -- chroot /host mkdir -p /mnt/kubegenx /mnt/kubegenx-state
+    oc apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kubegenx-data
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+spec:
+  capacity:
+    storage: 300Gi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  local:
+    path: /mnt/kubegenx
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["${NODE}"]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kubegenx-state
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  local:
+    path: /mnt/kubegenx-state
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["${NODE}"]
+EOF
+  fi
+  oc apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kubegenx-data
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: manual
+  volumeName: kubegenx-data
+  resources:
+    requests:
+      storage: 300Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kubegenx-state
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/part-of: kubegenx
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: manual
+  volumeName: kubegenx-state
+  resources:
+    requests:
+      storage: 10Gi
+EOF
+fi
 
 TMP="$(mktemp -d)"
-cp -R "$ROOT/deploy/base/." "$TMP/"
-sed -i '' "s/555000555/${RUN_UID}/" "$TMP/manifests.yaml"
-# fsGroup is the second 555000555, already replaced with RUN_UID. Put the supplemental gid back on fsGroup only.
-python3 - "$TMP/manifests.yaml" "$RUN_UID" "$FS_GID" <<'PY'
+cp -R "$ROOT/deploy/${VOLUME}/." "$TMP/"
+python3 - "$TMP/manifests.yaml" "$RUN_UID" "$FS_GID" "$NODE" <<'PY'
 import pathlib, sys
-path, uid, gid = sys.argv[1:]
+path, uid, gid, node = sys.argv[1:]
 text = pathlib.Path(path).read_text()
-text = text.replace(f"runAsUser: {uid}", f"runAsUser: {uid}", 1)
+text = text.replace("555000555", uid)
 text = text.replace(f"fsGroup: {uid}", f"fsGroup: {gid}", 1)
+if node:
+    text = text.replace("kubegenx-node-name", node)
 pathlib.Path(path).write_text(text)
 PY
 oc apply -k "$TMP"
@@ -134,6 +267,11 @@ if [[ "$CLEAN" -eq 1 ]]; then
   # PV deletion (reclaim Retain, objects stay in the bucket).
   echo "clean-on-start: removing /data/datasets and /data/exports"
   oc delete pod -n "$NS" kgx-wipe --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+  NODE_SELECTOR_YAML=""
+  if [[ -n "$NODE" ]]; then
+    NODE_SELECTOR_YAML="  nodeSelector:
+    kubernetes.io/hostname: ${NODE}"
+  fi
   oc apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -143,6 +281,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: kubegenx
 spec:
+${NODE_SELECTOR_YAML}
   restartPolicy: Never
   securityContext:
     runAsNonRoot: true
@@ -188,4 +327,8 @@ EOF
 else
   echo "keeping existing datasets and exports"
 fi
-echo "deployed uid=${RUN_UID} fsgroup=${FS_GID} bucket=${BUCKET}"
+if [[ "$VOLUME" == "s3" ]]; then
+  echo "deployed volume=s3 uid=${RUN_UID} fsgroup=${FS_GID} bucket=${BUCKET}"
+else
+  echo "deployed volume=node-local node=${NODE} uid=${RUN_UID} fsgroup=${FS_GID}"
+fi

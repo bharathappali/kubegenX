@@ -45,12 +45,20 @@ type App struct {
 	ConverterImage string
 	ThanosImage    string
 	Hub            *Hub
+	Node           string
 
 	mu           sync.Mutex
 	statusMu     sync.Mutex
 	exporting    map[string]bool
 	activeExport string
 	lastStatus   map[string]time.Time
+}
+
+func (a *App) nodeSelector() map[string]string {
+	if a.Node == "" {
+		return nil
+	}
+	return map[string]string{"kubernetes.io/hostname": a.Node}
 }
 
 func (a *App) Loop(ctx context.Context) {
@@ -721,6 +729,7 @@ func (a *App) ensureJob(parent *corev1.ConfigMap, dataset string, w spec.Workers
 				Spec: corev1.PodSpec{
 					RestartPolicy:                corev1.RestartPolicyOnFailure,
 					ServiceAccountName:           "kubegenx-worker",
+					NodeSelector:                 a.nodeSelector(),
 					AutomountServiceAccountToken: &auto,
 					SecurityContext:              podSC(),
 					Containers: []corev1.Container{{
@@ -783,6 +792,7 @@ func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string)
 				ObjectMeta: metav1.ObjectMeta{Labels: partLabels(map[string]string{"app": objName, "kubegenx.io/export": exportName})},
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           "kubegenx-thanos",
+					NodeSelector:                 a.nodeSelector(),
 					AutomountServiceAccountToken: &auto,
 					SecurityContext:              podSC(),
 					Containers: []corev1.Container{

@@ -76,6 +76,7 @@ func main() {
 	a := &app.App{
 		NS: ns, Data: data, Scratch: scratch, Store: st, Kube: kube, Dyn: dyn,
 		WorkerImage: workerImage, ConverterImage: converterImage, ThanosImage: thanosImage, Hub: app.NewHub(),
+		Node: env("KUBEGENX_NODE", ""),
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

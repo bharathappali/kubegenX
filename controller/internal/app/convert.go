@@ -168,6 +168,7 @@ func (a *App) ensureConverterJob(parent *corev1.ConfigMap, exportName, dataset s
 				Spec: corev1.PodSpec{
 					RestartPolicy:                corev1.RestartPolicyOnFailure,
 					ServiceAccountName:           "kubegenx-worker",
+					NodeSelector:                 a.nodeSelector(),
 					AutomountServiceAccountToken: &auto,
 					SecurityContext:              podSC(),
 					Containers: []corev1.Container{{
