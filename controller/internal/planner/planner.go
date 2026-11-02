@@ -191,6 +191,8 @@ func Build(dataset string, tpl spec.Template, epoch string) (*Plan, error) {
 	if err := p.checkExperimentNames(); err != nil {
 		return nil, err
 	}
+	// A nil slice encodes as null. The worker rejects null where it expects a list.
+	p.fillEmpty()
 	raw, err := json.Marshal(p)
 	if err != nil {
 		return nil, err
@@ -200,6 +202,33 @@ func Build(dataset string, tpl spec.Template, epoch string) (*Plan, error) {
 	// Digest covers the body without itself; re-marshal is stable because
 	// Digest was empty during the first marshal and we set it after.
 	return p, nil
+}
+
+func (p *Plan) fillEmpty() {
+	if p.Namespaces == nil {
+		p.Namespaces = []Namespace{}
+	}
+	if p.Workloads == nil {
+		p.Workloads = []Workload{}
+	}
+	if p.Pods == nil {
+		p.Pods = []Pod{}
+	}
+	if p.Containers == nil {
+		p.Containers = []Container{}
+	}
+	if p.GPUs == nil {
+		p.GPUs = []GPUEntity{}
+	}
+	if p.Nodes == nil {
+		p.Nodes = []Node{}
+	}
+	if p.Items == nil {
+		p.Items = []WorkItem{}
+	}
+	if p.LabelKeys == nil {
+		p.LabelKeys = []string{}
+	}
 }
 
 func (p *Plan) checkExperimentNames() error {

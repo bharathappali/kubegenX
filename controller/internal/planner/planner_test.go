@@ -96,6 +96,36 @@ func TestPlanSmallDeterministic(t *testing.T) {
 	}
 }
 
+func TestDisabledGPUSerializesAsEmptyList(t *testing.T) {
+	tpl := spec.DefaultTemplate()
+	tpl.GPU.Enabled = false
+	tpl.Features = []string{"cpu", "memory"}
+	tpl.Topology.Mode = "NamespaceMatrix"
+	tpl.Topology.Namespaces.Count = 1
+	tpl.Topology.WorkloadsPerNamespace = 1
+	tpl.Time = spec.Time{Step: "15s", Duration: "6h", Chunk: "6h"}
+	p, err := Build("nogpu", tpl, "2026-10-05T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probe struct {
+		GPUs []GPUEntity `json:"gpus"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		t.Fatal(err)
+	}
+	if probe.GPUs == nil {
+		t.Fatal("gpus encoded as null")
+	}
+	if len(probe.GPUs) != 0 {
+		t.Fatalf("gpus %d", len(probe.GPUs))
+	}
+}
+
 func TestPlanHundredThousand(t *testing.T) {
 	tpl := spec.DefaultTemplate()
 	tpl.Topology.Mode = "TotalWorkloads"
