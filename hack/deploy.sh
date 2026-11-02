@@ -245,6 +245,16 @@ spec:
 EOF
 fi
 
+if [[ "$VOLUME" == "node-local" ]]; then
+  MCS="$(oc get ns "$NS" -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.mcs}')"
+  if [[ -z "$MCS" ]]; then
+    echo "namespace selinux level missing" >&2
+    exit 1
+  fi
+  echo "node-local: shared selinux level ${MCS}"
+  sed "s|__MCS_LEVEL__|${MCS}|" "$ROOT/deploy/node-local/scc.yaml" | oc apply -f -
+fi
+
 TMP="$(mktemp -d)"
 cp -R "$ROOT/deploy/${VOLUME}/." "$TMP/"
 python3 - "$TMP/manifests.yaml" "$RUN_UID" "$FS_GID" "$NODE" <<'PY'

@@ -92,7 +92,7 @@ func (a *App) freeCapacity(ctx context.Context) (cpuMilli, memBytes int64, err e
 	}
 	ready := map[string]struct{}{}
 	for _, n := range nodes.Items {
-		if n.Spec.Unschedulable || !nodeReady(n) {
+		if !a.countsForEffort(n) {
 			continue
 		}
 		cpuMilli += n.Status.Allocatable.Cpu().MilliValue()
@@ -121,6 +121,14 @@ func (a *App) freeCapacity(ctx context.Context) (cpuMilli, memBytes int64, err e
 		memBytes = 0
 	}
 	return cpuMilli, memBytes, nil
+}
+
+// countsForEffort is every ready node, or only the pinned node in node-local mode.
+func (a *App) countsForEffort(n corev1.Node) bool {
+	if n.Spec.Unschedulable || !nodeReady(n) {
+		return false
+	}
+	return a.Node == "" || n.Name == a.Node
 }
 
 func nodeReady(n corev1.Node) bool {

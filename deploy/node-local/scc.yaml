@@ -1,0 +1,43 @@
+# Node-local volumes are a real filesystem, so SELinux applies. OpenShift
+# otherwise gives every pod its own category and workers cannot read the plan
+# the controller wrote. This constraint pins one level for all three accounts.
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: kubegenx-shared
+  annotations:
+    kubernetes.io/description: Shared SELinux level for KubeGenX pods on one local volume.
+priority: 20
+allowPrivilegeEscalation: false
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+readOnlyRootFilesystem: false
+requiredDropCapabilities:
+  - ALL
+fsGroup:
+  type: MustRunAs
+runAsUser:
+  type: MustRunAsRange
+seLinuxContext:
+  type: MustRunAs
+  seLinuxOptions:
+    type: container_t
+    level: __MCS_LEVEL__
+seccompProfiles:
+  - runtime/default
+supplementalGroups:
+  type: RunAsAny
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - persistentVolumeClaim
+  - projected
+  - secret
+users:
+  - system:serviceaccount:kube-gen-x:kubegenx-controller
+  - system:serviceaccount:kube-gen-x:kubegenx-worker
+  - system:serviceaccount:kube-gen-x:kubegenx-thanos

@@ -1,6 +1,11 @@
 package app
 
-import "testing"
+import (
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 func TestWorkerCountUsesTheLargerShare(t *testing.T) {
 	// 40 free cores and 80Gi free: a worker is 500m and 1Gi, so 80 CPU slots and 80 memory slots.
@@ -28,6 +33,23 @@ func TestWorkerCountFloorsAtTwo(t *testing.T) {
 	got := workerCount(effortPercent("low"), 1000, 500, 2<<30, 1<<30)
 	if got != 2 {
 		t.Fatalf("got %d", got)
+	}
+}
+
+func TestNodeLocalEffortUsesOnlyThePinnedNode(t *testing.T) {
+	ready := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "f35-h17-000-r640"}}
+	ready.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+	other := ready
+	other.Name = "f35-h18-000-r640"
+	pinned := &App{Node: ready.Name}
+	if !pinned.countsForEffort(ready) {
+		t.Fatal("pinned node was skipped")
+	}
+	if pinned.countsForEffort(other) {
+		t.Fatal("another node was counted")
+	}
+	if !(&App{}).countsForEffort(other) {
+		t.Fatal("shared volume skipped a ready node")
 	}
 }
 
