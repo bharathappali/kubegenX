@@ -22,7 +22,7 @@ Thanos serves the series a live kubelet, kube-state-metrics, and DCGM endpoint w
 - `container_cpu_usage_seconds_total` and `container_cpu_cfs_throttled_seconds_total`
 - `container_memory_working_set_bytes` and `container_memory_rss`
 - OpenShift-style recorded CPU rates and memory gauges
-- `kube_pod_info`, owners, phases, requests, limits, and restarts, expanded from the plan while the blocks are written
+- `kube_pod_info`, `kube_pod_labels` (`label_org_id` / `label_cluster_id`), owners, phases, requests, limits, and restarts, expanded from the plan while the blocks are written
 - `DCGM_FI_DEV_GPU_UTIL`, `DCGM_FI_DEV_MEM_COPY_UTIL`, and `DCGM_FI_DEV_FB_USED` for workloads planned with a GPU
 
 The aggregation API returns the same CPU and memory signals per container, already reduced to each interval.

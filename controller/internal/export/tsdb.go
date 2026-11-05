@@ -368,6 +368,12 @@ func (b *builder) ksmPods(ns map[int]planner.Namespace, wl map[int]planner.Workl
 			info[k] = v
 		}
 		b.staticRange("kube_pod_info", info, steps, 1)
+		// KSM-style: custom labels live on kube_pod_labels as label_<key>.
+		podLabels := map[string]string{"namespace": n.Name, "pod": p.Name, "uid": p.UID}
+		for k, v := range n.Labels {
+			podLabels["label_"+ksmLabelKey(k)] = v
+		}
+		b.staticRange("kube_pod_labels", podLabels, steps, 1)
 		own := map[string]string{
 			"namespace": n.Name, "pod": p.Name, "owner_kind": ownerKind(w),
 			"owner_name": ownerName(w), "owner_is_controller": "true",
@@ -537,6 +543,20 @@ func kindLower(k string) string {
 		return "statefulset"
 	}
 	return "deployment"
+}
+
+// ksmLabelKey mirrors kube-state-metrics / Kruize bulk: non [A-Za-z0-9_] → _.
+func ksmLabelKey(key string) string {
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range key {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 func containerID(seed uint64, ctr int, life uint8) string {
