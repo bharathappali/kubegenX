@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Remove only KubeGenX objects. Clears finalizers on those objects when a delete stalls.
+# Uses the current oc context (or CONTEXT / --context if set). Do not hard-code a cluster.
 set -euo pipefail
 export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
-CTX="default/api-cluster-6x4ft-6x4ft-sandbox1763-opentlc-com:6443/kube:admin"
 NS="kube-gen-x"
-oc config use-context "$CTX" >/dev/null
+
+if [[ -n "${CONTEXT:-}" ]]; then
+  oc config use-context "$CONTEXT" >/dev/null
+fi
+
+echo "undeploying from context: $(oc config current-context)"
 
 strip_ns() {
   oc get cm,secret,svc,deploy,job,route,pvc,pod,sa,role,rolebinding -n "$NS" -l app.kubernetes.io/part-of=kubegenx -o name 2>/dev/null \
