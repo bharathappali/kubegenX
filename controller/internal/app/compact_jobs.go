@@ -79,33 +79,43 @@ func (a *App) runThanosCompact(parent *corev1.ConfigMap, exportName, dataset str
 		slog.Info("thanos compact day start", "export", exportName, "day", b.Key, "job", name, "volume", a.volumeMode())
 	}
 
-	doneDays := 0
-	for doneDays < len(dayNames) {
-		doneDays = 0
+	// Remember completions in-process: Job TTL can delete a finished Job while
+	// slower day Jobs are still running; a later Get NotFound must not fail the run.
+	completed := map[string]bool{}
+	for len(completed) < len(dayNames) {
 		var fail error
+		runningKey := ""
 		for i, name := range dayNames {
+			if completed[name] {
+				continue
+			}
 			st, err := a.jobTerminal(c, name)
 			if err != nil {
+				// TTL / explicit delete after we already recorded Complete is fine
+				// (skipped via completed[]). NotFound before Complete is fatal.
 				return err
 			}
 			switch st {
 			case "complete":
-				doneDays++
+				completed[name] = true
 			case "failed":
 				fail = fmt.Errorf("day compact job %s failed", name)
 			case "running":
-				a.setCompactProgress(parent, exportName, "compacting-days", doneDays, totalSteps,
-					fmt.Sprintf("day %s running (%d/%d days done)", buckets[i].Key, doneDays, len(buckets)))
+				runningKey = buckets[i].Key
 			}
 		}
 		if fail != nil {
 			return fail
 		}
+		doneDays := len(completed)
 		if doneDays == len(dayNames) {
 			break
 		}
-		a.setCompactProgress(parent, exportName, "compacting-days", doneDays, totalSteps,
-			fmt.Sprintf("%d/%d day jobs complete", doneDays, len(buckets)))
+		msg := fmt.Sprintf("%d/%d day jobs complete", doneDays, len(buckets))
+		if runningKey != "" {
+			msg = fmt.Sprintf("day %s running (%d/%d days done)", runningKey, doneDays, len(buckets))
+		}
+		a.setCompactProgress(parent, exportName, "compacting-days", doneDays, totalSteps, msg)
 		select {
 		case <-c.Done():
 			return fmt.Errorf("day compact timed out")
@@ -245,7 +255,9 @@ func (a *App) createCompactFinalJob(c context.Context, parent *corev1.ConfigMap,
 
 func (a *App) baseCompactJob(parent *corev1.ConfigMap, name string, labels map[string]string) *batchv1.Job {
 	backoff := int32(1)
-	ttl := int32(600)
+	// Keep finished Jobs around until compactOrchestrate deletes them. A short TTL
+	// raced the wait loop (completed day Job garbage-collected → NotFound → Failed).
+	ttl := int32(7200)
 	completions := int32(1)
 	auto := false
 	return &batchv1.Job{
