@@ -196,7 +196,7 @@ func (a *App) createCompactDayJob(c context.Context, parent *corev1.ConfigMap, e
 	if a.needsCompactScratch() {
 		job.Spec.Template.Spec.InitContainers = []corev1.Container{
 			a.stageContainer("stage-in", "compact-sync-in-window", exportName, dataset, minT, maxT, true),
-			a.thanosCompactContainer(objName+"-objstore-scratch", minT, maxT, true),
+			a.thanosCompactContainer(objName+"-objstore-scratch", minT, maxT, true, day.Key),
 		}
 		job.Spec.Template.Spec.Containers = []corev1.Container{
 			a.stageContainer("stage-out", "compact-sync-out-window", exportName, dataset, "", "", false),
@@ -204,7 +204,7 @@ func (a *App) createCompactDayJob(c context.Context, parent *corev1.ConfigMap, e
 		job.Spec.Template.Spec.Volumes = a.compactScratchVolumes(objName)
 	} else {
 		job.Spec.Template.Spec.Containers = []corev1.Container{
-			a.thanosCompactContainer(objName+"-objstore", minT, maxT, false),
+			a.thanosCompactContainer(objName+"-objstore", minT, maxT, false, day.Key),
 		}
 		job.Spec.Template.Spec.Volumes = a.compactLocalVolumes(objName)
 	}
@@ -224,7 +224,7 @@ func (a *App) createCompactFinalJob(c context.Context, parent *corev1.ConfigMap,
 	if a.needsCompactScratch() {
 		job.Spec.Template.Spec.InitContainers = []corev1.Container{
 			a.stageContainer("stage-in", "compact-sync-in", exportName, dataset, "", "", true),
-			a.thanosCompactContainer(objName+"-objstore-scratch", "", "", true),
+			a.thanosCompactContainer(objName+"-objstore-scratch", "", "", true, "final"),
 		}
 		job.Spec.Template.Spec.Containers = []corev1.Container{
 			a.stageContainer("stage-out", "compact-sync-out", exportName, dataset, "", "", false),
@@ -232,7 +232,7 @@ func (a *App) createCompactFinalJob(c context.Context, parent *corev1.ConfigMap,
 		job.Spec.Template.Spec.Volumes = a.compactScratchVolumes(objName)
 	} else {
 		job.Spec.Template.Spec.Containers = []corev1.Container{
-			a.thanosCompactContainer(objName+"-objstore", "", "", false),
+			a.thanosCompactContainer(objName+"-objstore", "", "", false, "final"),
 		}
 		job.Spec.Template.Spec.Volumes = a.compactLocalVolumes(objName)
 	}
@@ -293,10 +293,15 @@ func (a *App) stageContainer(name, mode, exportName, dataset, minT, maxT string,
 	}
 }
 
-func (a *App) thanosCompactContainer(secretName, minT, maxT string, useScratch bool) corev1.Container {
+func (a *App) thanosCompactContainer(secretName, minT, maxT string, useScratch bool, workSuffix string) corev1.Container {
+	// Parallel day jobs share the data PVC; each needs its own --data-dir or they
+	// race creating the same compact/…/index paths ("no such file or directory").
 	dataDir := "/data/compact-work"
 	if useScratch {
 		dataDir = "/scratch/compact-work"
+	}
+	if workSuffix != "" {
+		dataDir = dataDir + "-" + workSuffix
 	}
 	_ = secretName // volume wiring selects the secret; name kept for call-site clarity.
 	args := []string{
