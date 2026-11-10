@@ -24,6 +24,7 @@ type Topology struct {
 	Kinds                 map[string]float64 `json:"kinds" yaml:"kinds"`
 	Replicas              Replicas           `json:"replicas" yaml:"replicas"`
 	ContainersPerPod      map[string]float64 `json:"containersPerPod" yaml:"containersPerPod"`
+	OneContainerPerPod    bool               `json:"oneContainerPerPod" yaml:"oneContainerPerPod"`
 }
 
 type NamespaceSpec struct {

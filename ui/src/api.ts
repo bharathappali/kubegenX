@@ -99,6 +99,10 @@ export interface ExportItem {
   startedAt?: number;
   finishedAt?: number;
   createdAt?: number;
+  compactStage?: string;
+  compactDone?: number;
+  compactTotal?: number;
+  compactMessage?: string;
 }
 
 export interface ExportBlock {
@@ -108,9 +112,19 @@ export interface ExportBlock {
   stepHi?: number;
 }
 
+export interface StorageDataset {
+  name: string;
+  bytes: number;
+  parquetBytes?: number;
+  tsdbBytes?: number;
+  reserved: number;
+  phase: string;
+  percent?: number;
+}
+
 export interface StorageView {
   capacityBytes: number;
   usedBytes: number;
-  datasets: { name: string; bytes: number; reserved: number; phase: string }[];
+  datasets: StorageDataset[];
   exports: ExportItem[];
 }

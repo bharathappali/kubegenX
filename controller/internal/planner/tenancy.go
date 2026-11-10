@@ -258,9 +258,35 @@ func weightedPick(seed uint64, feature, entity uint32, weights []float64) int {
 	return len(weights) - 1
 }
 
+func countsUniform(counts []int) bool {
+	if len(counts) == 0 {
+		return true
+	}
+	first := counts[0]
+	for _, c := range counts[1:] {
+		if c != first {
+			return false
+		}
+	}
+	return true
+}
+
+func flatShares(n int) []float64 {
+	shares := make([]float64, n)
+	if n == 0 {
+		return shares
+	}
+	v := 1.0 / float64(n)
+	for i := range shares {
+		shares[i] = v
+	}
+	return shares
+}
+
 // assignTenancy returns the org id and cluster id for each namespace.
-// A cluster belongs to one org. Bigger orgs own more clusters, and the
-// busiest namespaces land on those orgs.
+// A cluster belongs to one org. When every namespace has the same workload
+// count, orgs and clusters are filled evenly; otherwise bigger orgs own more
+// clusters and the busiest namespaces land on those orgs.
 func assignTenancy(seed uint64, counts []int) (orgs, clusters []string) {
 	ns := len(counts)
 	orgs = make([]string, ns)
@@ -290,7 +316,13 @@ func assignTenancy(seed uint64, counts []int) (orgs, clusters []string) {
 	if err != nil {
 		clNames = clusterCatalog()[:nCl]
 	}
-	shares := expShares(nOrg)
+	even := countsUniform(counts)
+	var shares []float64
+	if even {
+		shares = flatShares(nOrg)
+	} else {
+		shares = expShares(nOrg)
+	}
 	quota := splitByShare(nCl, shares)
 	type slot struct {
 		org   int
@@ -316,6 +348,27 @@ func assignTenancy(seed uint64, counts []int) (orgs, clusters []string) {
 		}
 		return counts[order[a]] > counts[order[b]]
 	})
+	if even {
+		// Round-robin namespaces across orgs, then across each org's clusters,
+		// so org and per-org cluster occupancy stay balanced.
+		byOrgNS := make([][]int, nOrg)
+		for i, ni := range order {
+			o := i % nOrg
+			byOrgNS[o] = append(byOrgNS[o], ni)
+		}
+		for o := 0; o < nOrg; o++ {
+			clSlots := byOrg[o]
+			if len(clSlots) == 0 {
+				continue
+			}
+			for j, ni := range byOrgNS[o] {
+				s := slots[clSlots[j%len(clSlots)]]
+				orgs[ni] = orgNames[s.org]
+				clusters[ni] = clNames[s.index]
+			}
+		}
+		return orgs, clusters
+	}
 	placed := make([]bool, ns)
 	limit := nCl
 	if limit > len(order) {

@@ -529,7 +529,17 @@ func (a *App) listKind(kind string) ([]map[string]any, error) {
 			phase, _ := a.Store.Phase(name)
 			p, _ := a.Store.Progress(name)
 			item["phase"] = phase
-			item["progress"] = statusFrom(p, phase, "")
+			prog := statusFrom(p, phase, "")
+			if phase == "Deleting" {
+				done, total, _ := a.Store.DeleteProgress(name)
+				applyDeletePercent(prog, done, total)
+			}
+			if phase == "Verifying" {
+				if vp, err := a.Store.VerifyPercent(name); err == nil && vp > 0 {
+					prog["percent"] = vp
+				}
+			}
+			item["progress"] = prog
 			if man, err := readManifest(a.Data, name); err == nil {
 				item["namespaces"] = man["namespaces"]
 				item["workloads"] = man["workloads"]

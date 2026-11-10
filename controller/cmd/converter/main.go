@@ -40,6 +40,42 @@ func main() {
 	data := env("KUBEGENX_DATA", "/data")
 	scratch := env("KUBEGENX_SCRATCH", "/scratch")
 	workerID := env("HOSTNAME", "converter")
+	mode := os.Getenv("KUBEGENX_MODE")
+	switch mode {
+	case "compact-sync-in", "compact-sync-out", "compact-sync-in-window", "compact-sync-out-window":
+		if exportName == "" || dataset == "" {
+			slog.Error("missing KUBEGENX_EXPORT or KUBEGENX_DATASET")
+			os.Exit(1)
+		}
+		dataTSDB := export.TSDBDir(data, dataset, exportName)
+		scratchTSDB := filepath.Join(scratch, "tsdb")
+		var err error
+		switch mode {
+		case "compact-sync-in":
+			slog.Info("compact stage-in", "src", dataTSDB, "dst", scratchTSDB)
+			err = export.CompactSyncIn(dataTSDB, scratchTSDB)
+		case "compact-sync-out":
+			slog.Info("compact stage-out", "src", scratchTSDB, "dst", dataTSDB)
+			err = export.CompactSyncOut(scratchTSDB, dataTSDB)
+		case "compact-sync-in-window":
+			start, end, perr := parseCompactWindow()
+			if perr != nil {
+				slog.Error("window", "err", perr)
+				os.Exit(1)
+			}
+			slog.Info("compact stage-in-window", "src", dataTSDB, "dst", scratchTSDB, "start", start, "end", end)
+			err = export.CompactSyncInWindow(dataTSDB, scratchTSDB, start, end)
+		case "compact-sync-out-window":
+			slog.Info("compact stage-out-window", "src", scratchTSDB, "dst", dataTSDB)
+			err = export.CompactSyncOutWindow(scratchTSDB, dataTSDB)
+		}
+		if err != nil {
+			slog.Error(mode, "err", err)
+			os.Exit(1)
+		}
+		slog.Info(mode + " ok")
+		return
+	}
 	if exportName == "" || dataset == "" || base == "" {
 		slog.Error("missing KUBEGENX_EXPORT, KUBEGENX_DATASET, or KUBEGENX_CONTROLLER")
 		os.Exit(1)
@@ -170,4 +206,21 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func parseCompactWindow() (time.Time, time.Time, error) {
+	minRaw := os.Getenv("KUBEGENX_MIN_TIME")
+	maxRaw := os.Getenv("KUBEGENX_MAX_TIME")
+	if minRaw == "" || maxRaw == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("missing KUBEGENX_MIN_TIME or KUBEGENX_MAX_TIME")
+	}
+	start, err := time.Parse(time.RFC3339, minRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	end, err := time.Parse(time.RFC3339, maxRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return start, end, nil
 }

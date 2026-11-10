@@ -107,7 +107,7 @@ curl -sS "$BASE/api/v1/datasets/$NAME/orgs"
 curl -sS "$BASE/api/v1/datasets/$NAME/verify"
 ```
 
-`GET /api/v1/datasets/{name}/orgs` lists the `org_id` values that appear in the plan and, under each one, the `cluster_id` values that belong to it, with namespace and workload counts. A cluster belongs to one org. The catalog behind the names has 100 orgs spelled the way the company is pronounced (`amazan`, `googal`, `pacebuk`) and 10000 region-style clusters (`us-east-1`, `eu-west-12`); a dataset uses a small skewed subset chosen from its workload count.
+`GET /api/v1/datasets/{name}/orgs` lists the `org_id` values that appear in the plan and, under each one, the `cluster_id` values that belong to it, with namespace and workload counts. A cluster belongs to one org. The catalog behind the names has 100 orgs spelled the way the company is pronounced (`amazan`, `googal`, `pacebuk`) and 10000 region-style clusters (`us-east-1`, `eu-west-12`); a dataset uses a small subset chosen from its workload count. When every namespace has the same workload count, orgs and clusters are filled evenly; when counts differ (for example Zipf / TotalWorkloads), bigger orgs still get more clusters and busier namespaces.
 
 `layout` has `chunks`, `chunkSeconds` (21600, six hours), `stepSeconds`, `epoch`, `workloads`, and `namespaces`. `verify` returns `200` with `files`, `expected`, `rows`, and `resets`. A mismatch is `409`.
 
@@ -116,6 +116,8 @@ There is also `GET /api/v1/ws?topics=dataset:<name>`, the WebSocket the status p
 ## Create the template you actually want
 
 `spec` is the scenario. Omit it, or send `{}`, and the controller stores the built-in default: 15 days at a 15-second step, 3 namespaces, 5 workloads each. The Create page in the UI sends a full spec and a shorter duration. A script that should match a UI dataset sends the same fields. The shape is `controller/internal/spec/spec.go` (`seed`, `topology`, `profiles`, `gpu`, `nodes`, `time`, `features`, `workloadLabels`, `workers`, `workItem`).
+
+`topology.oneContainerPerPod` forces every pod to a single container when `true`. When `false` or omitted, `topology.containersPerPod` weights pick 1–3 containers (default `1:0.75`, `2:0.18`, `3:0.07`). The Create page exposes this as a toggle.
 
 `time.step` is a Go duration (`15s`). `time.duration` accepts Go durations and `Nd` for days (`1d`, `15d`). `time.chunk` is `6h` in every path the controller plans today.
 
@@ -197,6 +199,7 @@ curl -sS "$BASE/api/v1/exports/demo"
 | `Configured` | Saved. Call serve. |
 | `Queued` | Waiting for generation, or for the single conversion slot. |
 | `Building` | `blocks` / `blocksTotal` is the progress. `workers` is how many converters are running. |
+| `Compacting` | One-shot vertical compaction before store/query come up. |
 | `Serving` | `url` is set. |
 | `Failed` | Stop. `kgx-ex-<name>-status` in `kube-gen-x` has `error` inside `status.json`. Serve again after you have looked at it. |
 

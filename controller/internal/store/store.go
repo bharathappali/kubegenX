@@ -56,25 +56,29 @@ type Session struct {
 }
 
 type ExportRow struct {
-	Name        string `json:"name"`
-	Dataset     string `json:"dataset"`
-	Phase       string `json:"phase"`
-	Type        string `json:"type"`
-	SessionID   string `json:"sessionId,omitempty"`
-	Anchor      string `json:"anchor,omitempty"`
-	StartTime   string `json:"startTime"`
-	EndTime     string `json:"endTime,omitempty"`
-	Interval    string `json:"interval,omitempty"`
-	Blocks      int    `json:"blocks"`
-	BlocksTotal int    `json:"blocksTotal"`
-	Bytes       int64  `json:"bytes"`
-	Workers     int    `json:"workers,omitempty"`
-	Heap        int64  `json:"heap,omitempty"`
-	Budget      int64  `json:"budget,omitempty"`
-	URL         string `json:"url"`
-	StartedAt   int64  `json:"startedAt,omitempty"`
-	FinishedAt  int64  `json:"finishedAt,omitempty"`
-	CreatedAt   int64  `json:"createdAt,omitempty"`
+	Name           string `json:"name"`
+	Dataset        string `json:"dataset"`
+	Phase          string `json:"phase"`
+	Type           string `json:"type"`
+	SessionID      string `json:"sessionId,omitempty"`
+	Anchor         string `json:"anchor,omitempty"`
+	StartTime      string `json:"startTime"`
+	EndTime        string `json:"endTime,omitempty"`
+	Interval       string `json:"interval,omitempty"`
+	Blocks         int    `json:"blocks"`
+	BlocksTotal    int    `json:"blocksTotal"`
+	Bytes          int64  `json:"bytes"`
+	Workers        int    `json:"workers,omitempty"`
+	Heap           int64  `json:"heap,omitempty"`
+	Budget         int64  `json:"budget,omitempty"`
+	URL            string `json:"url"`
+	StartedAt      int64  `json:"startedAt,omitempty"`
+	FinishedAt     int64  `json:"finishedAt,omitempty"`
+	CreatedAt      int64  `json:"createdAt,omitempty"`
+	CompactStage   string `json:"compactStage,omitempty"`
+	CompactDone    int    `json:"compactDone,omitempty"`
+	CompactTotal   int    `json:"compactTotal,omitempty"`
+	CompactMessage string `json:"compactMessage,omitempty"`
 }
 
 func Open(dir string) (*Store, error) {
@@ -107,6 +111,9 @@ CREATE TABLE IF NOT EXISTS datasets (
   reserved INTEGER NOT NULL DEFAULT 0,
   estimate INTEGER NOT NULL DEFAULT 0,
   parquet_deleted INTEGER NOT NULL DEFAULT 0,
+  delete_total INTEGER NOT NULL DEFAULT 0,
+  delete_done INTEGER NOT NULL DEFAULT 0,
+  verify_percent REAL NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS items (
@@ -158,6 +165,10 @@ CREATE TABLE IF NOT EXISTS events (
 	alters := []string{
 		`ALTER TABLE exports ADD COLUMN type TEXT NOT NULL DEFAULT 'thanos'`,
 		`ALTER TABLE exports ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE exports ADD COLUMN compact_stage TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE exports ADD COLUMN compact_done INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE exports ADD COLUMN compact_total INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE exports ADD COLUMN compact_message TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE exports ADD COLUMN anchor TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE exports ADD COLUMN end_time TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE exports ADD COLUMN interval TEXT NOT NULL DEFAULT ''`,
@@ -170,6 +181,9 @@ CREATE TABLE IF NOT EXISTS events (
 		`ALTER TABLE exports ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE datasets ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE datasets ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE datasets ADD COLUMN delete_total INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE datasets ADD COLUMN delete_done INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE datasets ADD COLUMN verify_percent REAL NOT NULL DEFAULT 0`,
 	}
 	for _, q := range alters {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
@@ -392,6 +406,133 @@ func (s *Store) ParquetDeleted(dataset string) (bool, error) {
 	return n == 1, err
 }
 
+func (s *Store) SetVerifyPercent(name string, pct float64) error {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	_, err := s.db.Exec(`UPDATE datasets SET verify_percent=?, updated_at=? WHERE name=?`, pct, time.Now().Unix(), name)
+	return err
+}
+
+func (s *Store) VerifyPercent(name string) (float64, error) {
+	var pct float64
+	err := s.db.QueryRow(`SELECT COALESCE(verify_percent,0) FROM datasets WHERE name=?`, name).Scan(&pct)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return pct, err
+}
+
+func (s *Store) SetDeleteProgress(name string, done, total int64) error {
+	if done < 0 {
+		done = 0
+	}
+	if total < 0 {
+		total = 0
+	}
+	if done > total && total > 0 {
+		done = total
+	}
+	_, err := s.db.Exec(`UPDATE datasets SET delete_done=?, delete_total=?, updated_at=? WHERE name=?`,
+		done, total, time.Now().Unix(), name)
+	return err
+}
+
+func (s *Store) DeleteProgress(name string) (done, total int64, err error) {
+	err = s.db.QueryRow(`SELECT COALESCE(delete_done,0), COALESCE(delete_total,0) FROM datasets WHERE name=?`, name).Scan(&done, &total)
+	if err == sql.ErrNoRows {
+		return 0, 0, nil
+	}
+	return done, total, err
+}
+
+func (s *Store) DecBytes(dataset string, n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE datasets SET bytes=CASE WHEN bytes>? THEN bytes-? ELSE 0 END, updated_at=? WHERE name=?`,
+		n, n, time.Now().Unix(), dataset)
+	return err
+}
+
+func (s *Store) DecExportBytesByDataset(dataset string, n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	rows, err := s.db.Query(`SELECT name, bytes FROM exports WHERE dataset=? AND bytes>0 ORDER BY bytes DESC`, dataset)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type row struct {
+		name  string
+		bytes int64
+	}
+	var list []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.name, &r.bytes); err != nil {
+			return err
+		}
+		list = append(list, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	left := n
+	for _, r := range list {
+		if left <= 0 {
+			break
+		}
+		take := r.bytes
+		if take > left {
+			take = left
+		}
+		if _, err := s.db.Exec(`UPDATE exports SET bytes=bytes-?, updated_at=? WHERE name=?`, take, time.Now().Unix(), r.name); err != nil {
+			return err
+		}
+		left -= take
+	}
+	return nil
+}
+
+func (s *Store) DeleteExportsForDataset(dataset string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	names := []string{}
+	rows, err := tx.Query(`SELECT name FROM exports WHERE dataset=?`, dataset)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return err
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, n := range names {
+		if _, err := tx.Exec(`DELETE FROM export_blocks WHERE export_name=?`, n); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM exports WHERE name=?`, n); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) DeleteDataset(name string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -509,7 +650,7 @@ func (s *Store) TouchExport(name, phase string, blocks, total int, bytes int64, 
 	if err != nil {
 		return err
 	}
-	if phase == "Building" {
+	if phase == "Building" || phase == "Compacting" {
 		_, err = s.db.Exec(`UPDATE exports SET finished_at=0 WHERE name=?`, name)
 		return err
 	}
@@ -543,6 +684,12 @@ func (s *Store) TouchExportLive(name string, workers int, heap, budget int64) er
 	return err
 }
 
+func (s *Store) TouchExportCompact(name, stage string, done, total int, message string) error {
+	_, err := s.db.Exec(`UPDATE exports SET phase='Compacting', compact_stage=?, compact_done=?, compact_total=?, compact_message=?, finished_at=0, updated_at=? WHERE name=?`,
+		stage, done, total, message, time.Now().Unix(), name)
+	return err
+}
+
 func (s *Store) UpsertExport(row ExportRow) error {
 	return s.SaveExport(row)
 }
@@ -550,10 +697,11 @@ func (s *Store) UpsertExport(row ExportRow) error {
 func scanExport(row *ExportRow, scan func(dest ...any) error) error {
 	return scan(&row.Name, &row.Dataset, &row.Phase, &row.StartTime, &row.Blocks, &row.Bytes, &row.URL,
 		&row.Type, &row.SessionID, &row.Anchor, &row.EndTime, &row.Interval, &row.BlocksTotal, &row.StartedAt, &row.CreatedAt,
-		&row.Workers, &row.Heap, &row.Budget, &row.FinishedAt)
+		&row.Workers, &row.Heap, &row.Budget, &row.FinishedAt,
+		&row.CompactStage, &row.CompactDone, &row.CompactTotal, &row.CompactMessage)
 }
 
-const exportCols = `name, dataset, phase, COALESCE(start_time,''), blocks, bytes, COALESCE(url,''), COALESCE(type,'thanos'), COALESCE(session_id,''), COALESCE(anchor,''), COALESCE(end_time,''), COALESCE(interval,''), COALESCE(blocks_total,0), COALESCE(started_at,0), COALESCE(created_at,0), COALESCE(workers,0), COALESCE(heap,0), COALESCE(budget,0), COALESCE(finished_at,0)`
+const exportCols = `name, dataset, phase, COALESCE(start_time,''), blocks, bytes, COALESCE(url,''), COALESCE(type,'thanos'), COALESCE(session_id,''), COALESCE(anchor,''), COALESCE(end_time,''), COALESCE(interval,''), COALESCE(blocks_total,0), COALESCE(started_at,0), COALESCE(created_at,0), COALESCE(workers,0), COALESCE(heap,0), COALESCE(budget,0), COALESCE(finished_at,0), COALESCE(compact_stage,''), COALESCE(compact_done,0), COALESCE(compact_total,0), COALESCE(compact_message,'')`
 
 func (s *Store) GetExport(name string) (ExportRow, error) {
 	var row ExportRow
@@ -584,22 +732,30 @@ func (s *Store) DeleteExport(name string) error {
 }
 
 type StorageDataset struct {
-	Name     string `json:"name"`
-	Bytes    int64  `json:"bytes"`
-	Reserved int64  `json:"reserved"`
-	Phase    string `json:"phase"`
+	Name         string  `json:"name"`
+	Bytes        int64   `json:"bytes"`
+	ParquetBytes int64   `json:"parquetBytes"`
+	TsdbBytes    int64   `json:"tsdbBytes"`
+	Reserved     int64   `json:"reserved"`
+	Phase        string  `json:"phase"`
+	Percent      float64 `json:"percent,omitempty"`
 }
 
 func (s *Store) Storage() (used int64, datasets []StorageDataset, exports []ExportRow, err error) {
-	rows, err := s.db.Query(`SELECT name, bytes, reserved, phase FROM datasets ORDER BY name`)
+	rows, err := s.db.Query(`SELECT name, bytes, reserved, phase, COALESCE(delete_done,0), COALESCE(delete_total,0) FROM datasets ORDER BY name`)
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var d StorageDataset
-		if err := rows.Scan(&d.Name, &d.Bytes, &d.Reserved, &d.Phase); err != nil {
+		var delDone, delTotal int64
+		if err := rows.Scan(&d.Name, &d.Bytes, &d.Reserved, &d.Phase, &delDone, &delTotal); err != nil {
 			return 0, nil, nil, err
+		}
+		d.ParquetBytes = d.Bytes
+		if d.Phase == "Deleting" && delTotal > 0 {
+			d.Percent = float64(delDone) / float64(delTotal) * 100
 		}
 		used += d.Bytes
 		datasets = append(datasets, d)
@@ -612,8 +768,13 @@ func (s *Store) Storage() (used int64, datasets []StorageDataset, exports []Expo
 	if err != nil {
 		return 0, nil, nil, err
 	}
+	tsdbByDS := map[string]int64{}
 	for _, e := range exports {
 		used += e.Bytes
+		tsdbByDS[e.Dataset] += e.Bytes
+	}
+	for i := range datasets {
+		datasets[i].TsdbBytes = tsdbByDS[datasets[i].Name]
 	}
 	return used, datasets, exports, nil
 }

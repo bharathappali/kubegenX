@@ -116,7 +116,10 @@ export function Live({ onNotice }: { onNotice: (s: string) => void }) {
         const fromHash = datasetFromHash();
         const current = fromHash && items.some((d) => d.name === fromHash)
           ? fromHash
-          : items.find((d) => (d.phase ?? d.progress?.phase) === "Generating")?.name ?? items[0]?.name ?? "";
+          : items.find((d) => {
+              const ph = d.phase ?? d.progress?.phase;
+              return ph === "Generating" || ph === "Verifying";
+            })?.name ?? items[0]?.name ?? "";
         setName(current);
         if (current) {
           const hash = "#/status?name=" + encodeURIComponent(current);
@@ -179,9 +182,12 @@ export function Live({ onNotice }: { onNotice: (s: string) => void }) {
   const done = prog.items?.done ?? cells.filter((c) => c.state === "done").length;
   const leased = prog.items?.leased ?? cells.filter((c) => c.state === "leased").length;
   const failed = prog.items?.failed ?? cells.filter((c) => c.state === "failed").length;
-  const pct = prog.percent ?? (total ? (done / total) * 100 : 0);
+  const pct = prog.percent ?? (total ? (done / total) * 80 : 0);
 
-  const creating = prog.phase === "Generating" && !!prog.startedAt && !prog.finishedAt;
+  const creating =
+    (prog.phase === "Generating" || prog.phase === "Verifying") &&
+    !!prog.startedAt &&
+    !prog.finishedAt;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!creating) return;
@@ -196,14 +202,15 @@ export function Live({ onNotice }: { onNotice: (s: string) => void }) {
     const prev = samples.current[samples.current.length - 1];
     if (!prev || prev.done !== done) samples.current.push({ t: now, done });
     if (samples.current.length > 12) samples.current.shift();
-    if (pct >= 100) return "0s";
+    if (prog.phase === "Ready" || pct >= 100) return "0s";
+    if (prog.phase === "Verifying") return "verifying";
     const first = samples.current[0];
     const last = samples.current[samples.current.length - 1];
     const dt = (last.t - first.t) / 1000;
     const dd = last.done - first.done;
     if (dt < 1 || dd <= 0) return "—";
     return formatEta(((total - done) * dt) / dd);
-  }, [done, pct, total]);
+  }, [done, pct, total, prog.phase]);
 
   const chunkHours = layout?.chunkSeconds ? layout.chunkSeconds / 3600 : 6;
   const byChunk = new Map<number, Cell[]>();
@@ -267,7 +274,7 @@ export function Live({ onNotice }: { onNotice: (s: string) => void }) {
         <Stat label="Creation" value={creation} hint={creating ? "so far" : prog.finishedAt ? "done" : "not recorded"} />
         <Stat label="Workloads" value={layout ? String(layout.workloads) : "—"} hint={layout ? `${layout.namespaces.length} namespaces` : "planning"} />
       </SimpleGrid>
-      <Progress value={pct} color="mint" size="lg" radius="xl" animated={leased > 0 && pct < 100} />
+      <Progress value={pct} color="mint" size="lg" radius="xl" animated={(leased > 0 || prog.phase === "Verifying") && pct < 100} />
       <div className="option-row">
         <div className="tabs-center">
           <SegmentedControl

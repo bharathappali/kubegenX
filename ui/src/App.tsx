@@ -5,15 +5,15 @@ import {
   Modal,
   NumberInput,
   Popover,
-  Progress,
   SegmentedControl,
   Select,
   Stack,
+  Switch,
   Text,
   TextInput,
   Title,
 } from "@mantine/core";
-import { api, type DatasetItem, type ExportItem, type StorageView } from "./api";
+import { api, type DatasetItem, type ExportItem, type StorageDataset, type StorageView } from "./api";
 import { Icon, IconButton, EmptyMark } from "./icons";
 import { EffortField } from "./effort";
 import { datasetFromHash, Live } from "./live";
@@ -44,12 +44,16 @@ function phaseWord(phase: string): string {
   switch (phase) {
     case "Generating":
       return "GENERATING";
+    case "Verifying":
+      return "VERIFYING";
     case "Ready":
       return "READY";
     case "Failed":
       return "FAILED";
     case "Building":
       return "BUILDING";
+    case "Compacting":
+      return "COMPACTING";
     case "Serving":
       return "SERVING";
     case "Pending":
@@ -266,6 +270,7 @@ function Wizard({ onNotice }: { onNotice: (s: string) => void }) {
   const [days, setDays] = useState<number | string>(1);
   const [step, setStep] = useState("15s");
   const [effort, setEffort] = useState("xhigh");
+  const [oneContainerPerPod, setOneContainerPerPod] = useState(false);
   const [busy, setBusy] = useState(false);
   const workloadCount = mode === "NamespaceMatrix" ? Number(namespaces) * Number(perNs) : Number(total);
   const percent = Number(gpuPercent) || 0;
@@ -288,7 +293,10 @@ function Wizard({ onNotice }: { onNotice: (s: string) => void }) {
             buckets: [{ range: [1, 3], share: 70 }, { range: [4, 7], share: 22 }, { range: [8, 10], share: 8 }],
             statefulSetBuckets: [{ range: [1, 3], share: 85 }, { range: [4, 7], share: 15 }],
           },
-          containersPerPod: { "1": 0.75, "2": 0.18, "3": 0.07 },
+          oneContainerPerPod,
+          containersPerPod: oneContainerPerPod
+            ? { "1": 1 }
+            : { "1": 0.75, "2": 0.18, "3": 0.07 },
         },
         profiles: {
           cpu: { idle: 0.15, low: 0.4, medium: 0.3, high: 0.15 },
@@ -367,6 +375,12 @@ function Wizard({ onNotice }: { onNotice: (s: string) => void }) {
         />
       </Group>
       <EffortField value={effort} onChange={setEffort} />
+      <Switch
+        label="One container per pod"
+        description="Off keeps the usual mix of 1–3 containers per pod."
+        checked={oneContainerPerPod}
+        onChange={(e) => setOneContainerPerPod(e.currentTarget.checked)}
+      />
       <Text c="dimmed" size="sm">Most workloads have 1–3 replicas. Usage is a mix of idle, low, medium, and high.</Text>
       <Button color="mint" c="#1B2430" onClick={() => void submit()} loading={busy}>Create dataset</Button>
     </Stack>
@@ -378,7 +392,7 @@ function exporterLabel(rows: ExportItem[]): string {
   let thanos = false;
   let generic = false;
   for (const row of rows) {
-    if (row.phase !== "Serving" && row.phase !== "Building" && row.phase !== "Queued") continue;
+    if (row.phase !== "Serving" && row.phase !== "Building" && row.phase !== "Queued" && row.phase !== "Compacting") continue;
     if (row.type === "generic") generic = true;
     else thanos = true;
   }
@@ -477,16 +491,24 @@ function Datasets({ onNotice }: { onNotice: (s: string) => void }) {
       {items.map((d) => {
         const pct = d.progress?.percent ?? 0;
         const ph = d.phase ?? d.progress?.phase ?? "unknown";
+        const deleting = ph === "Deleting";
         const active = exporterLabel(exports.filter((e) => e.dataset === d.name));
+        const status = deleting
+          ? phaseLabel("Deleting", pct)
+          : ph === "Queued"
+            ? "Queued · waiting for the export to finish"
+            : `${ph} · ${active}`;
         return (
           <div key={d.name} className="ds-card glass">
-            <button type="button" className="ds-open" onClick={() => openStatus(d.name)}>
+            <button type="button" className="ds-open" onClick={() => { if (!deleting) openStatus(d.name); }} disabled={deleting}>
               <span className="name">{d.name}</span>
-              <div className="meta">{ph === "Queued" ? "Queued · waiting for the export to finish" : `${ph} · ${active}`}</div>
+              <div className="meta">{status}</div>
               {facts(d)}
-              <div className="bar"><span style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} /></div>
+              <div className={deleting ? "bar deleting" : "bar"}><span style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} /></div>
             </button>
-            <button type="button" className="icon-btn ds-delete" aria-label={`Delete ${d.name}`} onClick={() => setDrop(d.name)}><Icon name="trash" /></button>
+            {deleting ? null : (
+              <button type="button" className="icon-btn ds-delete" aria-label={`Delete ${d.name}`} onClick={() => setDrop(d.name)}><Icon name="trash" /></button>
+            )}
           </div>
         );
       })}
@@ -496,22 +518,40 @@ function Datasets({ onNotice }: { onNotice: (s: string) => void }) {
       <table className="data">
         <thead><tr><th>Name</th><th>Phase</th><th>Exporter</th><th>Namespaces</th><th>Workloads</th><th>Samples</th><th>Entries</th><th>Days</th><th>Interval</th><th /></tr></thead>
         <tbody>
-          {items.map((d) => (
-            <tr key={d.name} onClick={() => openStatus(d.name)}>
-              <td>{d.name}</td>
-              <td>{(d.phase ?? d.progress?.phase) === "Queued" ? "Queued · waiting for the export" : (d.phase ?? d.progress?.phase)}</td>
-              <td>{exporterLabel(exports.filter((e) => e.dataset === d.name))}</td>
-              <td>{d.namespaces ?? "—"}</td>
-              <td>{d.workloads ?? "—"}</td>
-              <td title={d.samples?.toLocaleString()}>{d.samples == null ? "—" : shortCount(d.samples)}</td>
-              <td title={d.entries?.toLocaleString()}>{d.entries == null ? "—" : shortCount(d.entries)}</td>
-              <td>{dayLabel(d.days)}</td>
-              <td>{intervalLabel(d.stepSeconds)}</td>
-              <td>
-                <button type="button" className="icon-btn row-delete" aria-label={`Delete ${d.name}`} onClick={(e) => { e.stopPropagation(); setDrop(d.name); }}><Icon name="trash" /></button>
-              </td>
-            </tr>
-          ))}
+          {items.map((d) => {
+            const ph = d.phase ?? d.progress?.phase;
+            const deleting = ph === "Deleting";
+            const pct = d.progress?.percent ?? 0;
+            return (
+              <tr key={d.name} onClick={() => { if (!deleting) openStatus(d.name); }}>
+                <td>{d.name}</td>
+                <td>
+                  {deleting
+                    ? phaseLabel("Deleting", pct)
+                    : ph === "Queued"
+                      ? "Queued · waiting for the export"
+                      : ph}
+                  {deleting ? (
+                    <div className="bar deleting" style={{ marginTop: 6 }}>
+                      <span style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
+                    </div>
+                  ) : null}
+                </td>
+                <td>{exporterLabel(exports.filter((e) => e.dataset === d.name))}</td>
+                <td>{d.namespaces ?? "—"}</td>
+                <td>{d.workloads ?? "—"}</td>
+                <td title={d.samples?.toLocaleString()}>{d.samples == null ? "—" : shortCount(d.samples)}</td>
+                <td title={d.entries?.toLocaleString()}>{d.entries == null ? "—" : shortCount(d.entries)}</td>
+                <td>{dayLabel(d.days)}</td>
+                <td>{intervalLabel(d.stepSeconds)}</td>
+                <td>
+                  {deleting ? null : (
+                    <button type="button" className="icon-btn row-delete" aria-label={`Delete ${d.name}`} onClick={(e) => { e.stopPropagation(); setDrop(d.name); }}><Icon name="trash" /></button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -545,19 +585,104 @@ function gib(n: number): string {
   return (n / 1024 ** 3).toFixed(3);
 }
 
+const DATASET_HUES = [
+  "#E85D4C", "#3D8B6E", "#D4A017", "#5B6C8F", "#C45C8A",
+  "#2F8F9D", "#B86B3C", "#6B5B95", "#4A7C59", "#C47A3A",
+  "#3A6EA5", "#8B5E3C",
+];
+
+function hashName(name: string): number {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 33 + name.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+function datasetColors(name: string): { dark: string; light: string } {
+  const base = DATASET_HUES[hashName(name) % DATASET_HUES.length];
+  return {
+    dark: base,
+    light: `color-mix(in srgb, ${base} 45%, white)`,
+  };
+}
+
+function parquetOf(d: StorageDataset): number {
+  return d.parquetBytes ?? d.bytes ?? 0;
+}
+
+function tsdbOf(d: StorageDataset): number {
+  return d.tsdbBytes ?? 0;
+}
+
+function phaseLabel(phase: string | undefined, percent?: number): string {
+  if (phase === "Deleting") {
+    const pct = Math.max(0, Math.min(100, percent ?? 0));
+    return `Deleting · ${pct.toFixed(0)}%`;
+  }
+  return phase || "—";
+}
+
 function Storage() {
   const [view, setView] = useState<StorageView | null>(null);
-  useEffect(() => { void api<StorageView>("/api/v1/storage").then(setView); }, []);
+  useEffect(() => {
+    const load = () => void api<StorageView>("/api/v1/storage").then(setView).catch(() => undefined);
+    load();
+    const id = window.setInterval(load, 3000);
+    return () => window.clearInterval(id);
+  }, []);
   const cap = view?.capacityBytes ?? 1500 * 1024 * 1024 * 1024;
   const used = view?.usedBytes ?? 0;
-  const pct = cap ? (used / cap) * 100 : 0;
-  const empty = (view?.datasets ?? []).length === 0 && view;
+  const datasets = view?.datasets ?? [];
+  const empty = datasets.length === 0 && view;
+  const segments = datasets.flatMap((d) => {
+    const colors = datasetColors(d.name);
+    const parquet = parquetOf(d);
+    const tsdb = tsdbOf(d);
+    const out: { key: string; bytes: number; color: string; title: string }[] = [];
+    if (parquet > 0) out.push({ key: `${d.name}-parquet`, bytes: parquet, color: colors.dark, title: `${d.name} parquet` });
+    if (tsdb > 0) out.push({ key: `${d.name}-tsdb`, bytes: tsdb, color: colors.light, title: `${d.name} TSDB` });
+    return out;
+  });
+  const segmentTotal = segments.reduce((s, x) => s + x.bytes, 0) || used || 1;
   return (
     <div className="pane-fill">
       <Title order={2} mb="md">Storage</Title>
       <div className="glass" style={{ borderRadius: 18, padding: 16 }}>
         <Text>kubegenx-data · {(used / (1024 ** 3)).toFixed(3)} GiB of {(cap / (1024 ** 3)).toFixed(0)} GiB</Text>
-        <Progress value={pct} color="pink" mt="sm" />
+        <div className="storage-bar" role="img" aria-label="Storage by dataset">
+          {segments.length === 0 ? (
+            <span style={{ width: "100%", background: "transparent" }} />
+          ) : (
+            segments.map((s) => (
+              <span
+                key={s.key}
+                title={s.title}
+                style={{ width: `${(s.bytes / Math.max(cap, segmentTotal)) * 100}%`, background: s.color }}
+              />
+            ))
+          )}
+        </div>
+        {datasets.length > 0 ? (
+          <div className="storage-legend">
+            {datasets.map((d) => {
+              const colors = datasetColors(d.name);
+              return (
+                <div key={d.name} className="storage-legend-item">
+                  <span className="storage-swatch" aria-hidden>
+                    <span style={{ background: colors.dark }} />
+                    <span style={{ background: colors.light }} />
+                  </span>
+                  <span>
+                    {d.name}
+                    {" · "}
+                    parquet {gib(parquetOf(d))} GiB
+                    {" · "}
+                    TSDB {gib(tsdbOf(d))} GiB
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
       </div>
       {empty ? (
         <div className="center-empty">
@@ -566,10 +691,16 @@ function Storage() {
       ) : view ? (
         <div className="table-wrap" style={{ marginTop: 14 }}>
           <table className="data">
-            <thead><tr><th>Dataset</th><th>Phase</th><th>GiB</th><th>Reserved GiB</th></tr></thead>
+            <thead><tr><th>Dataset</th><th>Phase</th><th>Parquet GiB</th><th>TSDB GiB</th><th>Reserved GiB</th></tr></thead>
             <tbody>
-              {(view.datasets ?? []).map((d) => (
-                <tr key={d.name}><td>{d.name}</td><td>{d.phase}</td><td>{gib(d.bytes)}</td><td>{gib(d.reserved)}</td></tr>
+              {datasets.map((d) => (
+                <tr key={d.name}>
+                  <td>{d.name}</td>
+                  <td>{phaseLabel(d.phase, d.percent)}</td>
+                  <td>{gib(parquetOf(d))}</td>
+                  <td>{gib(tsdbOf(d))}</td>
+                  <td>{gib(d.reserved)}</td>
+                </tr>
               ))}
             </tbody>
           </table>

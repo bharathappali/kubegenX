@@ -8,6 +8,7 @@ import (
 
 	"github.com/bharathappali/kubegenx/internal/aggregate"
 	"github.com/bharathappali/kubegenx/internal/kruize"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func (a *App) serveExport(w http.ResponseWriter, r *http.Request) {
@@ -17,7 +18,7 @@ func (a *App) serveExport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	if row.Phase == "Building" || row.Phase == "Queued" || row.Phase == "Serving" {
+	if row.Phase == "Building" || row.Phase == "Queued" || row.Phase == "Serving" || row.Phase == "Compacting" {
 		writeErr(w, 409, "export is already "+row.Phase)
 		return
 	}
@@ -28,6 +29,23 @@ func (a *App) serveExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.Unlock()
+	// Failed thanos with complete blocks: retry compact+serve without rebuilding TSDB.
+	if row.Phase == "Failed" && (row.Type == "" || row.Type == "thanos") && row.BlocksTotal > 0 && row.Blocks >= row.BlocksTotal {
+		c, cancel := ctx()
+		defer cancel()
+		cm, err := a.Kube.CoreV1().ConfigMaps(a.NS).Get(c, cmName("export", name), metav1.GetOptions{})
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		_ = a.Store.TouchExportCompact(name, "starting", 0, 1, "retrying compaction")
+		row.Phase = "Compacting"
+		a.mu.Lock()
+		a.kickThanosEnsureLocked(cm, row)
+		a.mu.Unlock()
+		writeJSON(w, 202, map[string]any{"name": name, "phase": "Compacting"})
+		return
+	}
 	row.Phase = "Queued"
 	row.StartedAt = time.Now().Unix()
 	if err := a.Store.SaveExport(row); err != nil {

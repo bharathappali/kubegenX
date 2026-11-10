@@ -73,9 +73,31 @@ function etaLine(row: ExportItem): string {
 }
 
 function blockPercent(row: ExportItem): number | null {
+  if (row.phase === "Failed") return null;
+  if (row.phase === "Compacting") {
+    const total = row.compactTotal ?? 0;
+    if (total <= 0) return 0;
+    return Math.min(100, ((row.compactDone ?? 0) / total) * 100);
+  }
+  if (row.phase !== "Building" && row.phase !== "Queued") return null;
   const total = row.blocksTotal ?? 0;
   if (total <= 0) return null;
   return ((row.blocks ?? 0) / total) * 100;
+}
+
+function compactStageLabel(stage?: string): string {
+  switch (stage) {
+    case "starting":
+      return "Preparing";
+    case "compacting-days":
+      return "Day compaction";
+    case "compacting-final":
+      return "Final compaction";
+    case "done":
+      return "Compaction done";
+    default:
+      return stage ? stage.replace(/-/g, " ") : "Compacting";
+  }
 }
 
 function TimedNote({ message, onClose }: { message: string; onClose: () => void }) {
@@ -302,14 +324,23 @@ export function ExportRail({ dataset, onNotice }: { dataset: string; onNotice: (
     const { start, end } = bounds(thanos);
     const host = thanos.url ? thanosURL(thanos.url) : "";
     const pct = blockPercent(thanos);
+    const compacting = thanos.phase === "Compacting";
     return (
       <div className="export-row">
         <div className="session-head">
           <p><b>{thanos.phase}</b>{pct != null ? ` · ${pct.toFixed(2)}%` : ""}</p>
           <IconButton label="Delete export" onClick={() => setDrop(thanos)}><Icon name="trash" /></IconButton>
         </div>
-        {pct != null ? <Progress value={pct} color="mint" size="md" radius="xl" animated={thanos.phase === "Building"} /> : null}
+        {pct != null ? <Progress value={pct} color="mint" size="md" radius="xl" animated={thanos.phase === "Building" || compacting} /> : null}
         {thanos.phase === "Building" ? <p>Converting · {etaLine(thanos)}{liveLine(thanos)}</p> : null}
+        {compacting ? (
+          <p>
+            {compactStageLabel(thanos.compactStage)}
+            {thanos.compactTotal ? ` · ${thanos.compactDone ?? 0}/${thanos.compactTotal}` : ""}
+            {thanos.compactMessage ? ` · ${thanos.compactMessage}` : ""}
+          </p>
+        ) : null}
+        {thanos.phase === "Failed" ? <p>Failed{thanos.compactMessage ? ` · ${thanos.compactMessage}` : ""}. Serve retries from existing blocks when possible.</p> : null}
         {conversion ? <p>Time {conversion}</p> : null}
         {thanos.phase === "Queued" ? <p>Waiting. Generation or another export is using the cluster.</p> : null}
         {start ? <p>Start {plain(start)} UTC</p> : null}

@@ -379,7 +379,7 @@ func (p *Plan) assignPodsAndContainers(tpl spec.Template) {
 	}
 	_ = nsOf
 	for _, w := range p.Workloads {
-		nCont := pickContainerCount(tpl.Seed, uint32(w.ID), tpl.Topology.ContainersPerPod)
+		nCont := pickContainerCount(tpl.Seed, uint32(w.ID), tpl.Topology.ContainersPerPod, tpl.Topology.OneContainerPerPod)
 		names := containerNames(tpl.Seed, uint32(w.ID), w.Name, nCont)
 		// Requests and limits come from the pod template, so every replica of a
 		// container shares them. Usage means stay per replica.
@@ -553,7 +553,10 @@ func pickReplicas(seed uint64, entity uint32, buckets []spec.Bucket) int {
 	return 1
 }
 
-func pickContainerCount(seed uint64, wl uint32, weights map[string]float64) int {
+func pickContainerCount(seed uint64, wl uint32, weights map[string]float64, oneContainer bool) int {
+	if oneContainer {
+		return 1
+	}
 	if len(weights) == 0 {
 		weights = map[string]float64{"1": 0.75, "2": 0.18, "3": 0.07}
 	}

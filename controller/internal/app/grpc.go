@@ -53,6 +53,7 @@ func (q *queue) Complete(ctx context.Context, req *leasev1.CompleteRequest) (*le
 		return nil, err
 	}
 	q.app.publish(req.Dataset)
+	q.app.tryFinishDataset(req.Dataset)
 	return &leasev1.CompleteResponse{Ok: true}, nil
 }
 

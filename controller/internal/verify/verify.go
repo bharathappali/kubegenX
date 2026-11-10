@@ -19,7 +19,14 @@ type Report struct {
 	Resets   int `json:"resets"`
 }
 
+// Progress reports how far verification has gotten (done of total steps).
+type Progress func(done, total int)
+
 func Dataset(dataDir, name string) (Report, error) {
+	return DatasetWithProgress(dataDir, name, nil)
+}
+
+func DatasetWithProgress(dataDir, name string, onProgress Progress) (Report, error) {
 	var rep Report
 	dir := filepath.Join(dataDir, "datasets", name)
 	raw, err := os.ReadFile(filepath.Join(dir, "plan", "generation.json"))
@@ -30,6 +37,25 @@ func Dataset(dataDir, name string) (Report, error) {
 	if err := json.Unmarshal(raw, &plan); err != nil {
 		return rep, err
 	}
+	sampleN := 0
+	if len(plan.Containers) > 0 {
+		sampleN = 8
+	}
+	totalSteps := 1 + sampleN
+	if totalSteps < 1 {
+		totalSteps = 1
+	}
+	report := func(done int) {
+		if onProgress == nil {
+			return
+		}
+		if done > totalSteps {
+			done = totalSteps
+		}
+		onProgress(done, totalSteps)
+	}
+	report(0)
+
 	rep.Expected = ExpectedFiles(&plan)
 	rep.Files, err = samples.CountParquet(dir)
 	if err != nil {
@@ -38,10 +64,15 @@ func Dataset(dataDir, name string) (Report, error) {
 	if rep.Files != rep.Expected {
 		return rep, fmt.Errorf("parquet files %d, planned %d", rep.Files, rep.Expected)
 	}
+	report(1)
+
 	// A full read of every CPU row does not fit in the controller. Check a
 	// spread of item files, one at a time, and drop each file before the next.
 	if len(plan.Containers) > 0 {
-		n, resets, err := sampleCPU(dir)
+		n, resets, err := sampleCPU(dir, func(checked, want int) {
+			report(1 + checked)
+			_ = want
+		})
 		if err != nil {
 			return rep, err
 		}
@@ -51,10 +82,11 @@ func Dataset(dataDir, name string) (Report, error) {
 			return rep, fmt.Errorf("no cpu rows")
 		}
 	}
+	report(totalSteps)
 	return rep, nil
 }
 
-func sampleCPU(dir string) (rows, resets int, err error) {
+func sampleCPU(dir string, onFile func(checked, want int)) (rows, resets int, err error) {
 	pattern := filepath.Join(dir, "samples", "feature=cpu", "chunk=*", "item-*.parquet")
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
@@ -78,6 +110,9 @@ func sampleCPU(dir string) (rows, resets int, err error) {
 		rows += part
 		resets += r
 		checked++
+		if onFile != nil {
+			onFile(checked, sampleN)
+		}
 	}
 	return rows, resets, nil
 }

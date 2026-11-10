@@ -339,6 +339,61 @@ func TestReplicasShareRequestsAndLimits(t *testing.T) {
 	}
 }
 
+func TestOneContainerPerPod(t *testing.T) {
+	tpl := spec.DefaultTemplate()
+	tpl.Topology.Mode = "NamespaceMatrix"
+	tpl.Topology.Namespaces.Count = 2
+	tpl.Topology.WorkloadsPerNamespace = 8
+	tpl.Topology.OneContainerPerPod = true
+	tpl.Topology.ContainersPerPod = map[string]float64{"1": 0.1, "2": 0.45, "3": 0.45}
+	tpl.Time = spec.Time{Step: "15s", Duration: "1h", Chunk: "1h"}
+	tpl.GPU.Enabled = false
+	plan, err := Build("one-ctr", tpl, "2026-10-15T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPod := map[int]int{}
+	for _, c := range plan.Containers {
+		byPod[c.PodID]++
+	}
+	if len(byPod) == 0 {
+		t.Fatal("no containers")
+	}
+	for podID, n := range byPod {
+		if n != 1 {
+			t.Fatalf("pod %d has %d containers", podID, n)
+		}
+	}
+}
+
+func TestDefaultContainerMixAllowsMulti(t *testing.T) {
+	tpl := spec.DefaultTemplate()
+	tpl.Topology.Mode = "NamespaceMatrix"
+	tpl.Topology.Namespaces.Count = 3
+	tpl.Topology.WorkloadsPerNamespace = 20
+	tpl.Topology.OneContainerPerPod = false
+	tpl.Time = spec.Time{Step: "15s", Duration: "1h", Chunk: "1h"}
+	tpl.GPU.Enabled = false
+	plan, err := Build("multi-ctr", tpl, "2026-10-15T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPod := map[int]int{}
+	for _, c := range plan.Containers {
+		byPod[c.PodID]++
+	}
+	multi := false
+	for _, n := range byPod {
+		if n > 1 {
+			multi = true
+			break
+		}
+	}
+	if !multi {
+		t.Fatal("expected some pods with more than one container")
+	}
+}
+
 func dns1123(s string) bool {
 	if s == "" || len(s) > 63 {
 		return false

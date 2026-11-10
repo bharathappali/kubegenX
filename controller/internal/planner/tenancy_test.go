@@ -49,9 +49,10 @@ func TestOrgRangeFollowsWorkloadCount(t *testing.T) {
 }
 
 func TestTenancyLinksClusterToOneOrg(t *testing.T) {
+	// Uneven workload counts keep the skewed placement path.
 	counts := make([]int, 80)
 	for i := range counts {
-		counts[i] = 200
+		counts[i] = 50 + (i%10)*40
 	}
 	orgs, clusters := assignTenancy(424242, counts)
 	owner := map[string]string{}
@@ -83,6 +84,66 @@ func TestTenancyLinksClusterToOneOrg(t *testing.T) {
 	}
 	if maxN < minN*2 {
 		t.Fatalf("org spread max %d min %d", maxN, minN)
+	}
+	againO, againC := assignTenancy(424242, counts)
+	for i := range orgs {
+		if againO[i] != orgs[i] || againC[i] != clusters[i] {
+			t.Fatal("tenancy is not stable for the same seed")
+		}
+	}
+}
+
+func TestTenancyEvenWhenWorkloadsUniform(t *testing.T) {
+	counts := make([]int, 80)
+	for i := range counts {
+		counts[i] = 200
+	}
+	orgs, clusters := assignTenancy(424242, counts)
+	owner := map[string]string{}
+	perOrg := map[string]int{}
+	perOrgCluster := map[string]map[string]int{}
+	for i := range orgs {
+		if orgs[i] == "" || clusters[i] == "" {
+			t.Fatalf("empty label at %d", i)
+		}
+		if prev, ok := owner[clusters[i]]; ok && prev != orgs[i] {
+			t.Fatalf("cluster %s on %s and %s", clusters[i], prev, orgs[i])
+		}
+		owner[clusters[i]] = orgs[i]
+		perOrg[orgs[i]]++
+		if perOrgCluster[orgs[i]] == nil {
+			perOrgCluster[orgs[i]] = map[string]int{}
+		}
+		perOrgCluster[orgs[i]][clusters[i]]++
+	}
+	if len(perOrg) < 7 || len(perOrg) > 10 {
+		t.Fatalf("orgs %d", len(perOrg))
+	}
+	maxOrg, minOrg := 0, len(counts)
+	for _, n := range perOrg {
+		if n > maxOrg {
+			maxOrg = n
+		}
+		if n < minOrg {
+			minOrg = n
+		}
+	}
+	if maxOrg-minOrg > 1 {
+		t.Fatalf("org spread max %d min %d", maxOrg, minOrg)
+	}
+	for org, cls := range perOrgCluster {
+		maxCl, minCl := 0, len(counts)
+		for _, n := range cls {
+			if n > maxCl {
+				maxCl = n
+			}
+			if n < minCl {
+				minCl = n
+			}
+		}
+		if maxCl-minCl > 1 {
+			t.Fatalf("org %s cluster spread max %d min %d", org, maxCl, minCl)
+		}
 	}
 	againO, againC := assignTenancy(424242, counts)
 	for i := range orgs {

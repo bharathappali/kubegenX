@@ -176,36 +176,105 @@ func (a *App) reconcileDataset(cm *corev1.ConfigMap) {
 		}
 		return
 	}
-	if phase == "Generating" {
+	if phase == "Generating" || phase == "Verifying" {
 		_ = a.Store.MarkGenerationStart(name)
 		p, err := a.Store.Progress(name)
 		if err != nil {
 			return
 		}
 		if p.Total > 0 && p.Done+p.Failed == p.Total && p.Leased == 0 {
-			if p.Failed > 0 {
-				_ = a.Store.SetPhase(name, "Failed")
-				_ = a.Store.MarkGenerationFinish(name)
-				a.writeStatus(cm, name, statusFrom(p, "Failed", "workers finished with failures"))
-				return
-			}
-			if _, err := verify.Dataset(a.Data, name); err != nil {
-				_ = a.Store.SetPhase(name, "Failed")
-				_ = a.Store.MarkGenerationFinish(name)
-				a.writeStatus(cm, name, statusFrom(p, "Failed", err.Error()))
-				return
-			}
-			a.deleteJob(name)
-			_ = a.Store.SetPhase(name, "Ready")
-			_ = a.Store.MarkGenerationFinish(name)
-			st := statusFrom(p, "Ready", "")
-			st["workers"] = "released"
-			a.writeStatus(cm, name, st)
-			a.publishProgress(name, "Ready")
+			a.finishDataset(cm, name, p)
 			return
 		}
-		a.writeStatusThrottled(cm, name, statusFrom(p, "Generating", ""))
+		if phase == "Generating" {
+			a.writeStatusThrottled(cm, name, statusFrom(p, "Generating", ""))
+		}
 	}
+}
+
+func (a *App) finishDataset(cm *corev1.ConfigMap, name string, p store.Progress) {
+	if p.Failed > 0 {
+		_ = a.Store.SetPhase(name, "Failed")
+		_ = a.Store.MarkGenerationFinish(name)
+		a.writeStatus(cm, name, statusFrom(p, "Failed", "workers finished with failures"))
+		a.publishProgress(name, "Failed")
+		return
+	}
+	_ = a.Store.SetPhase(name, "Verifying")
+	_ = a.Store.SetVerifyPercent(name, 80)
+	st := statusFrom(p, "Verifying", "")
+	a.writeStatus(cm, name, st)
+	a.publishProgress(name, "Verifying")
+
+	_, err := verify.DatasetWithProgress(a.Data, name, func(done, total int) {
+		pct := verifyBarPercent(done, total)
+		_ = a.Store.SetVerifyPercent(name, pct)
+		a.publishProgress(name, "Verifying")
+	})
+	if err != nil {
+		_ = a.Store.SetPhase(name, "Failed")
+		_ = a.Store.MarkGenerationFinish(name)
+		a.writeStatus(cm, name, statusFrom(p, "Failed", err.Error()))
+		a.publishProgress(name, "Failed")
+		return
+	}
+	a.deleteJob(name)
+	_ = a.Store.SetVerifyPercent(name, 100)
+	_ = a.Store.SetPhase(name, "Ready")
+	_ = a.Store.MarkGenerationFinish(name)
+	ready := statusFrom(p, "Ready", "")
+	ready["workers"] = "released"
+	a.writeStatus(cm, name, ready)
+	a.publishProgress(name, "Ready")
+}
+
+// tryFinishDataset kicks verification as soon as the last item completes,
+// instead of waiting for the next reconcile poll.
+func (a *App) tryFinishDataset(name string) {
+	go func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		phase, _ := a.Store.Phase(name)
+		if phase != "Generating" && phase != "Verifying" {
+			return
+		}
+		p, err := a.Store.Progress(name)
+		if err != nil || p.Total == 0 || p.Done+p.Failed != p.Total || p.Leased != 0 {
+			return
+		}
+		if phase == "Verifying" {
+			// Another finish is already running under this lock.
+			return
+		}
+		c, cancel := ctx()
+		defer cancel()
+		cm, err := a.Kube.CoreV1().ConfigMaps(a.NS).Get(c, cmName("dataset", name), metav1.GetOptions{})
+		if err != nil {
+			return
+		}
+		a.finishDataset(cm, name, p)
+	}()
+}
+
+func generationBarPercent(done, total int) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return float64(done) / float64(total) * 80
+}
+
+func verifyBarPercent(done, total int) float64 {
+	if total <= 0 {
+		return 80
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	// Generation ends at 80%; verification fills 80 → 99; Ready sets 100.
+	return 80 + float64(done)/float64(total)*19
 }
 
 func (a *App) planDataset(cm *corev1.ConfigMap, name string, ds spec.Dataset) error {
@@ -337,8 +406,13 @@ func workloadBriefs(plan *planner.Plan) []map[string]any {
 
 func statusFrom(p store.Progress, phase, errMsg string) map[string]any {
 	pct := 0.0
-	if p.Total > 0 {
-		pct = float64(p.Done) / float64(p.Total) * 100
+	switch phase {
+	case "Ready":
+		pct = 100
+	case "Generating", "Queued", "Failed":
+		pct = generationBarPercent(p.Done, p.Total)
+	case "Verifying":
+		pct = 80
 	}
 	m := map[string]any{
 		"phase":   phase,
@@ -349,6 +423,17 @@ func statusFrom(p store.Progress, phase, errMsg string) map[string]any {
 		m["error"] = errMsg
 	}
 	return m
+}
+
+func applyDeletePercent(m map[string]any, done, total int64) {
+	if total <= 0 {
+		return
+	}
+	pct := float64(done) / float64(total) * 100
+	m["percent"] = pct
+	if kpi, ok := m["kpi"].(map[string]any); ok {
+		kpi["percent"] = pct
+	}
 }
 
 func (a *App) publish(dataset string) {
@@ -375,14 +460,23 @@ func (a *App) progressDoc(dataset, phase string) map[string]any {
 		cells = []store.Cell{}
 	}
 	doc["cells"] = cells
-	pct := 0.0
-	if p.Total > 0 {
-		pct = float64(p.Done) / float64(p.Total) * 100
-	}
+	pct, _ := doc["percent"].(float64)
 	doc["type"] = "progress"
 	doc["v"] = 1
 	doc["topic"] = "dataset:" + dataset
 	doc["kpi"] = map[string]any{"itemsDone": p.Done, "itemsTotal": p.Total, "bytes": p.Bytes, "percent": pct, "itemsLeased": p.Leased, "itemsFailed": p.Failed}
+	switch phase {
+	case "Deleting":
+		done, total, _ := a.Store.DeleteProgress(dataset)
+		applyDeletePercent(doc, done, total)
+	case "Verifying":
+		if vp, err := a.Store.VerifyPercent(dataset); err == nil && vp > 0 {
+			doc["percent"] = vp
+			if kpi, ok := doc["kpi"].(map[string]any); ok {
+				kpi["percent"] = vp
+			}
+		}
+	}
 	return doc
 }
 
@@ -444,6 +538,36 @@ func (a *App) writeStatusThrottled(parent *corev1.ConfigMap, name string, doc ma
 
 func (a *App) cleanupDataset(cm *corev1.ConfigMap, name string) {
 	a.deleteJob(name)
+	_ = a.Store.SetPhase(name, "Deleting")
+	dsPath := filepath.Join(a.Data, "datasets", name)
+	exPath := filepath.Join(a.Data, "exports", name)
+	total := dirSize(dsPath) + dirSize(exPath)
+	_ = a.Store.SetDeleteProgress(name, 0, total)
+	a.publishProgress(name, "Deleting")
+
+	var done int64
+	lastPub := time.Now()
+	bump := func(size int64, kind string) {
+		done += size
+		_ = a.Store.SetDeleteProgress(name, done, total)
+		switch kind {
+		case "parquet":
+			_ = a.Store.DecBytes(name, size)
+		case "tsdb":
+			_ = a.Store.DecExportBytesByDataset(name, size)
+		}
+		if time.Since(lastPub) >= 500*time.Millisecond {
+			a.publishProgress(name, "Deleting")
+			lastPub = time.Now()
+		}
+	}
+	_ = removeTreeProgress(dsPath, func(size int64) { bump(size, "parquet") })
+	_ = removeTreeProgress(exPath, func(size int64) { bump(size, "tsdb") })
+	if total > 0 {
+		_ = a.Store.SetDeleteProgress(name, total, total)
+	}
+	a.publishProgress(name, "Deleting")
+
 	c, cancel := ctx()
 	defer cancel()
 	list, err := a.Kube.CoreV1().ConfigMaps(a.NS).List(c, metav1.ListOptions{LabelSelector: "kubegenx.io/kind=export,kubegenx.io/dataset=" + name})
@@ -452,8 +576,7 @@ func (a *App) cleanupDataset(cm *corev1.ConfigMap, name string) {
 			_ = a.Kube.CoreV1().ConfigMaps(a.NS).Delete(c, list.Items[i].Name, metav1.DeleteOptions{})
 		}
 	}
-	_ = os.RemoveAll(filepath.Join(a.Data, "datasets", name))
-	_ = os.RemoveAll(filepath.Join(a.Data, "exports", name))
+	_ = a.Store.DeleteExportsForDataset(name)
 	_ = a.Store.DeleteDataset(name)
 	a.stripFinalizer(cm)
 }
@@ -492,10 +615,14 @@ func (a *App) reconcileExport(cm *corev1.ConfigMap) {
 	if err != nil {
 		return
 	}
-	if row.Phase != "Queued" && row.Phase != "Building" {
+	if row.Phase == "Queued" || row.Phase == "Building" {
+		a.kickExportLocked()
 		return
 	}
-	a.kickExportLocked()
+	// Recreate store/query after a manual Thanos delete without wiping export blocks.
+	if (row.Phase == "Serving" || row.Phase == "Compacting") && (row.Type == "" || row.Type == "thanos") {
+		a.kickThanosEnsureLocked(cm, row)
+	}
 }
 
 // exportsPending is true while any parquet conversion is queued or running.
@@ -506,7 +633,7 @@ func (a *App) exportsPending() bool {
 		return true
 	}
 	for _, row := range rows {
-		if row.Phase == "Queued" || row.Phase == "Building" {
+		if row.Phase == "Queued" || row.Phase == "Building" || row.Phase == "Compacting" {
 			return true
 		}
 	}
@@ -770,10 +897,67 @@ func (a *App) deleteJob(dataset string) {
 	}
 }
 
+func (a *App) kickThanosEnsureLocked(cm *corev1.ConfigMap, row store.ExportRow) {
+	if a.thanosServing(row.Name) {
+		return
+	}
+	if a.exporting != nil && a.exporting[row.Name] {
+		return
+	}
+	if a.exporting == nil {
+		a.exporting = map[string]bool{}
+	}
+	a.exporting[row.Name] = true
+	if a.activeExport == "" {
+		a.activeExport = row.Name
+	}
+	parent := cm.DeepCopy()
+	go a.reensureThanos(parent, row)
+}
+
+func (a *App) reensureThanos(cm *corev1.ConfigMap, row store.ExportRow) {
+	defer func() {
+		a.mu.Lock()
+		delete(a.exporting, row.Name)
+		if a.activeExport == row.Name {
+			a.activeExport = ""
+		}
+		a.kickExportLocked()
+		a.mu.Unlock()
+	}()
+	url, err := a.ensureThanos(cm, row.Name, row.Dataset)
+	if err != nil {
+		slogErr("thanos reensure", err)
+		_ = a.Store.TouchExport(row.Name, "Failed", row.Blocks, row.BlocksTotal, row.Bytes, "", row.StartedAt)
+		a.writeStatus(cm, row.Name, map[string]any{"phase": "Failed", "error": err.Error()})
+		return
+	}
+	start, _ := time.Parse(time.RFC3339, row.StartTime)
+	end, _ := time.Parse(time.RFC3339, row.EndTime)
+	url = withQueryWindow(url, start, end)
+	_ = a.Store.TouchExport(row.Name, "Serving", row.Blocks, row.BlocksTotal, row.Bytes, url, row.StartedAt)
+	a.writeStatus(cm, row.Name, map[string]any{
+		"phase": "Serving", "url": url, "blocks": row.Blocks, "blocksTotal": row.BlocksTotal, "bytes": row.Bytes,
+	})
+}
+
+func (a *App) thanosServing(exportName string) bool {
+	c, cancel := ctx()
+	defer cancel()
+	_, err := a.Kube.AppsV1().Deployments(a.NS).Get(c, "kgx-ex-"+exportName+"-store", metav1.GetOptions{})
+	return err == nil
+}
+
 func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string) (string, error) {
 	c, cancel := ctx()
 	defer cancel()
 	objName := "kgx-ex-" + exportName
+	a.setCompactProgress(parent, exportName, "starting", 0, 1, "preparing compaction")
+
+	// Drop the legacy co-located Deployment before creating the split pair.
+	prop := metav1.DeletePropagationBackground
+	_ = a.Kube.AppsV1().Deployments(a.NS).Delete(c, objName, metav1.DeleteOptions{PropagationPolicy: &prop})
+
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: objName + "-objstore", Namespace: a.NS, Labels: partLabels(nil), OwnerReferences: []metav1.OwnerReference{ownerRef(parent)}},
 		StringData: map[string]string{"objstore.yml": fmt.Sprintf("type: FILESYSTEM\nconfig:\n  directory: /data/exports/%s/%s/tsdb\n", dataset, exportName)},
@@ -781,65 +965,130 @@ func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string)
 	if _, err := a.Kube.CoreV1().Secrets(a.NS).Create(c, secret, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
 		return "", err
 	}
+	scratchSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: objName + "-objstore-scratch", Namespace: a.NS, Labels: partLabels(nil), OwnerReferences: []metav1.OwnerReference{ownerRef(parent)}},
+		StringData: map[string]string{"objstore.yml": "type: FILESYSTEM\nconfig:\n  directory: /scratch/tsdb\n"},
+	}
+	if _, err := a.Kube.CoreV1().Secrets(a.NS).Create(c, scratchSecret, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+		return "", err
+	}
+
+	if err := a.runThanosCompact(parent, exportName, dataset); err != nil {
+		return "", err
+	}
+
 	replicas := int32(1)
 	auto := false
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: objName, Namespace: a.NS, Labels: partLabels(map[string]string{"kubegenx.io/export": exportName}), OwnerReferences: []metav1.OwnerReference{ownerRef(parent)}},
+	storeName := objName + "-store"
+	queryName := objName + "-query"
+	storeApp := storeName
+	queryApp := queryName
+
+	storeDep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: storeName, Namespace: a.NS, Labels: partLabels(map[string]string{"kubegenx.io/export": exportName}), OwnerReferences: []metav1.OwnerReference{ownerRef(parent)}},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": objName}},
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": storeApp}},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: partLabels(map[string]string{"app": objName, "kubegenx.io/export": exportName})},
+				ObjectMeta: metav1.ObjectMeta{Labels: partLabels(map[string]string{"app": storeApp, "kubegenx.io/export": exportName})},
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           "kubegenx-thanos",
 					NodeSelector:                 a.nodeSelector(),
 					AutomountServiceAccountToken: &auto,
 					SecurityContext:              podSC(),
-					Containers: []corev1.Container{
-						{
-							Name: "store", Image: a.ThanosImage, ImagePullPolicy: corev1.PullAlways,
-							Args: []string{"store", "--objstore.config-file=/etc/thanos/objstore.yml", "--data-dir=/cache",
-								"--grpc-address=0.0.0.0:10901", "--http-address=0.0.0.0:10902",
-								"--store.enable-index-header-lazy-reader", "--sync-block-duration=30s"},
-							SecurityContext: containerSC(),
-							Resources:       res("500m", "1Gi"),
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "data", MountPath: "/data", ReadOnly: true},
-								{Name: "objstore", MountPath: "/etc/thanos", ReadOnly: true},
-								{Name: "cache", MountPath: "/cache"},
-							},
+					Containers: []corev1.Container{{
+						Name: "store", Image: a.ThanosImage, ImagePullPolicy: corev1.PullAlways,
+						Args: []string{"store", "--objstore.config-file=/etc/thanos/objstore.yml", "--data-dir=/cache",
+							"--grpc-address=0.0.0.0:10901", "--http-address=0.0.0.0:10902",
+							"--store.enable-index-header-lazy-reader",
+							"--store.enable-lazy-expanded-postings",
+							"--store.index-header-lazy-download-strategy=lazy",
+							"--index-cache-size=1GB",
+							"--chunk-pool-size=4GB",
+							"--store.grpc.series-max-concurrency=4",
+							"--sync-block-duration=15m"},
+						Env:             []corev1.EnvVar{{Name: "GOMAXPROCS", Value: "1"}},
+						SecurityContext: containerSC(),
+						// Store-heavy split of the 2 CPU / 30Gi Kruize-adjacent budget.
+						Resources: resReqLim("1", "10Gi", "1500m", "22Gi"),
+						Ports:     []corev1.ContainerPort{{Name: "grpc", ContainerPort: 10901}},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "data", MountPath: "/data", ReadOnly: true},
+							{Name: "objstore", MountPath: "/etc/thanos", ReadOnly: true},
+							{Name: "cache", MountPath: "/cache"},
 						},
-						{
-							Name: "query", Image: a.ThanosImage, ImagePullPolicy: corev1.PullAlways,
-							Args:            []string{"query", "--endpoint=127.0.0.1:10901", "--http-address=0.0.0.0:9090", "--grpc-address=127.0.0.1:10911"},
-							Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: 9090}},
-							SecurityContext: containerSC(),
-							Resources:       res("200m", "512Mi"),
-						},
-					},
+					}},
 					Volumes: []corev1.Volume{
 						{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "kubegenx-data"}}},
 						{Name: "objstore", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: objName + "-objstore"}}},
-						{Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: resourcePtr("8Gi")}}},
 					},
 				},
 			},
 		},
 	}
-	if _, err := a.Kube.AppsV1().Deployments(a.NS).Create(c, dep, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+	if _, err := a.Kube.AppsV1().Deployments(a.NS).Create(c, storeDep, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
 		return "", err
 	}
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: objName + "-query", Namespace: a.NS, Labels: partLabels(nil), OwnerReferences: []metav1.OwnerReference{ownerRef(parent)}},
+	storeSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: storeName, Namespace: a.NS, Labels: partLabels(nil), OwnerReferences: []metav1.OwnerReference{ownerRef(parent)}},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": objName},
+			Selector: map[string]string{"app": storeApp},
+			Ports:    []corev1.ServicePort{{Name: "grpc", Port: 10901, TargetPort: intstr.FromInt32(10901)}},
+		},
+	}
+	if _, err := a.Kube.CoreV1().Services(a.NS).Create(c, storeSvc, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+		return "", err
+	}
+
+	queryDep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: queryName, Namespace: a.NS, Labels: partLabels(map[string]string{"kubegenx.io/export": exportName}), OwnerReferences: []metav1.OwnerReference{ownerRef(parent)}},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": queryApp}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: partLabels(map[string]string{"app": queryApp, "kubegenx.io/export": exportName})},
+				Spec: corev1.PodSpec{
+					ServiceAccountName:           "kubegenx-thanos",
+					NodeSelector:                 a.nodeSelector(),
+					AutomountServiceAccountToken: &auto,
+					SecurityContext:              podSC(),
+					Containers: []corev1.Container{{
+						Name: "query", Image: a.ThanosImage, ImagePullPolicy: corev1.PullAlways,
+						Args: []string{"query",
+							"--endpoint=" + storeName + ":10901",
+							"--http-address=0.0.0.0:9090",
+							"--grpc-address=0.0.0.0:10911",
+							"--query.max-concurrent=6",
+							"--query.max-concurrent-select=4",
+							"--query.timeout=2m",
+							"--query.lookback-delta=15m"},
+						Env:             []corev1.EnvVar{{Name: "GOMAXPROCS", Value: "1"}},
+						Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: 9090}},
+						SecurityContext: containerSC(),
+						Resources:       resReqLim("250m", "2Gi", "500m", "8Gi"),
+					}},
+				},
+			},
+		},
+	}
+	if _, err := a.Kube.AppsV1().Deployments(a.NS).Create(c, queryDep, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+		return "", err
+	}
+	// Replace selector if an older query Service still points at the co-located pod.
+	_ = a.Kube.CoreV1().Services(a.NS).Delete(c, queryName, metav1.DeleteOptions{})
+	querySvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: queryName, Namespace: a.NS, Labels: partLabels(nil), OwnerReferences: []metav1.OwnerReference{ownerRef(parent)}},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": queryApp},
 			Ports:    []corev1.ServicePort{{Name: "http", Port: 9090, TargetPort: intstr.FromInt32(9090)}},
 		},
 	}
-	if _, err := a.Kube.CoreV1().Services(a.NS).Create(c, svc, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+	if _, err := a.Kube.CoreV1().Services(a.NS).Create(c, querySvc, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
 		return "", err
 	}
-	routeName := objName + "-query"
+
+	routeName := queryName
 	route := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "route.openshift.io/v1",
 		"kind":       "Route",
@@ -848,7 +1097,7 @@ func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string)
 			"labels": map[string]any{"app.kubernetes.io/part-of": "kubegenx", "app.kubernetes.io/managed-by": "kubegenx"},
 		},
 		"spec": map[string]any{
-			"to":   map[string]any{"kind": "Service", "name": objName + "-query"},
+			"to":   map[string]any{"kind": "Service", "name": queryName},
 			"port": map[string]any{"targetPort": "http"},
 			"tls":  map[string]any{"termination": "edge", "insecureEdgeTerminationPolicy": "Redirect"},
 		},
@@ -912,8 +1161,13 @@ func (a *App) deleteThanos(exportName string) {
 	objName := "kgx-ex-" + exportName
 	prop := metav1.DeletePropagationBackground
 	_ = a.Kube.AppsV1().Deployments(a.NS).Delete(c, objName, metav1.DeleteOptions{PropagationPolicy: &prop})
+	_ = a.Kube.AppsV1().Deployments(a.NS).Delete(c, objName+"-store", metav1.DeleteOptions{PropagationPolicy: &prop})
+	_ = a.Kube.AppsV1().Deployments(a.NS).Delete(c, objName+"-query", metav1.DeleteOptions{PropagationPolicy: &prop})
+	a.deleteCompactJobs(exportName)
+	_ = a.Kube.CoreV1().Services(a.NS).Delete(c, objName+"-store", metav1.DeleteOptions{})
 	_ = a.Kube.CoreV1().Services(a.NS).Delete(c, objName+"-query", metav1.DeleteOptions{})
 	_ = a.Kube.CoreV1().Secrets(a.NS).Delete(c, objName+"-objstore", metav1.DeleteOptions{})
+	_ = a.Kube.CoreV1().Secrets(a.NS).Delete(c, objName+"-objstore-scratch", metav1.DeleteOptions{})
 	gvr := schema.GroupVersionResource{Group: "route.openshift.io", Version: "v1", Resource: "routes"}
 	_ = a.Dyn.Resource(gvr).Namespace(a.NS).Delete(c, objName+"-query", metav1.DeleteOptions{})
 }
@@ -951,6 +1205,24 @@ func res(cpu, mem string) corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{Requests: corev1.ResourceList{
 		corev1.ResourceCPU: resource.MustParse(cpu), corev1.ResourceMemory: resource.MustParse(mem),
 	}}
+}
+
+func resReqLim(reqCPU, reqMem, limCPU, limMem string) corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(reqCPU),
+			corev1.ResourceMemory: resource.MustParse(reqMem),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(limCPU),
+			corev1.ResourceMemory: resource.MustParse(limMem),
+		},
+	}
+}
+
+func resourcePtr(q string) *resource.Quantity {
+	v := resource.MustParse(q)
+	return &v
 }
 
 func loadPlan(data, dataset string) (*planner.Plan, error) {

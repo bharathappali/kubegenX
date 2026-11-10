@@ -171,7 +171,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: quay.io/bharathappali/kube-gen-x:controller-v0.1.1
+          image: quay.io/bharathappali/kube-gen-x:controller-v0.1.3-daycompact
           imagePullPolicy: Always
           env:
             - name: POD_NAMESPACE
@@ -188,10 +188,12 @@ spec:
               value: /scratch
             - name: GOMEMLIMIT
               value: 7GiB
+            - name: KUBEGENX_VOLUME
+              value: s3
             - name: KUBEGENX_WORKER_IMAGE
               value: quay.io/bharathappali/kube-gen-x:worker-v0.1.1
             - name: KUBEGENX_CONVERTER_IMAGE
-              value: quay.io/bharathappali/kube-gen-x:converter-v0.1.1
+              value: quay.io/bharathappali/kube-gen-x:converter-v0.1.3-daycompact
             - name: KUBEGENX_THANOS_IMAGE
               value: quay.io/thanos/thanos:v0.42.4
             - name: KUBEGENX_POD_UID
