@@ -949,8 +949,9 @@ func (a *App) thanosServing(exportName string) bool {
 }
 
 func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string) (string, error) {
+	// Compact can take hours. Do not share one short ctx() across compact + Deploy/Route
+	// creates — after compact the 30s deadline is already dead and Thanos never comes up.
 	c, cancel := ctx()
-	defer cancel()
 	objName := "kgx-ex-" + exportName
 	a.setCompactProgress(parent, exportName, "starting", 0, 1, "preparing compaction")
 
@@ -963,6 +964,7 @@ func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string)
 		StringData: map[string]string{"objstore.yml": fmt.Sprintf("type: FILESYSTEM\nconfig:\n  directory: /data/exports/%s/%s/tsdb\n", dataset, exportName)},
 	}
 	if _, err := a.Kube.CoreV1().Secrets(a.NS).Create(c, secret, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+		cancel()
 		return "", err
 	}
 	scratchSecret := &corev1.Secret{
@@ -970,12 +972,17 @@ func (a *App) ensureThanos(parent *corev1.ConfigMap, exportName, dataset string)
 		StringData: map[string]string{"objstore.yml": "type: FILESYSTEM\nconfig:\n  directory: /scratch/tsdb\n"},
 	}
 	if _, err := a.Kube.CoreV1().Secrets(a.NS).Create(c, scratchSecret, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+		cancel()
 		return "", err
 	}
+	cancel()
 
 	if err := a.runThanosCompact(parent, exportName, dataset); err != nil {
 		return "", err
 	}
+
+	c, cancel = ctx()
+	defer cancel()
 
 	replicas := int32(1)
 	auto := false
